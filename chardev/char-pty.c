@@ -40,7 +40,6 @@ struct PtyChardev {
     int read_bytes;
 
     int connected;
-    GSource *timer_src;
 };
 typedef struct PtyChardev PtyChardev;
 
@@ -49,41 +48,7 @@ DECLARE_INSTANCE_CHECKER(PtyChardev, PTY_CHARDEV,
 
 static void pty_chr_state(Chardev *chr, int connected);
 
-static void pty_chr_timer_cancel(PtyChardev *s)
-{
-    if (s->timer_src) {
-        g_source_destroy(s->timer_src);
-        g_source_unref(s->timer_src);
-        s->timer_src = NULL;
-    }
-}
-
-static gboolean pty_chr_timer(gpointer opaque)
-{
-    struct Chardev *chr = CHARDEV(opaque);
-    PtyChardev *s = PTY_CHARDEV(opaque);
-
-    pty_chr_timer_cancel(s);
-    if (!s->connected) {
-        /* Next poll ... */
-        qemu_chr_be_update_read_handlers(chr, chr->gcontext);
-    }
-    return FALSE;
-}
-
-static void pty_chr_rearm_timer(Chardev *chr, int ms)
-{
-    PtyChardev *s = PTY_CHARDEV(chr);
-    char *name;
-
-    pty_chr_timer_cancel(s);
-    name = g_strdup_printf("pty-timer-%s", chr->label);
-    s->timer_src = qemu_chr_timeout_add_ms(chr, ms, pty_chr_timer, chr);
-    g_source_set_name(s->timer_src, name);
-    g_free(name);
-}
-
-static void pty_chr_update_read_handler(Chardev *chr)
+static void char_pty_poll_connection_status(Chardev *chr)
 {
     PtyChardev *s = PTY_CHARDEV(chr);
     GPollFD pfd;
@@ -91,21 +56,26 @@ static void pty_chr_update_read_handler(Chardev *chr)
     QIOChannelFile *fioc = QIO_CHANNEL_FILE(s->ioc);
 
     pfd.fd = fioc->fd;
-    pfd.events = G_IO_OUT;
+    /* If a PTY is connected, the HUP flag is cleared so
+     * we can poll the connection status this way. */
+    pfd.events = G_IO_HUP;
     pfd.revents = 0;
     rc = RETRY_ON_EINTR(g_poll(&pfd, 1, 0));
     assert(rc >= 0);
 
-    if (pfd.revents & G_IO_HUP) {
-        pty_chr_state(chr, 0);
-    } else {
-        pty_chr_state(chr, 1);
-    }
+    pty_chr_state(chr, !(pfd.revents & G_IO_HUP));
+}
+
+static void pty_chr_update_read_handler(Chardev *chr)
+{
+    char_pty_poll_connection_status(chr);
 }
 
 static int char_pty_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
     PtyChardev *s = PTY_CHARDEV(chr);
+
+    char_pty_poll_connection_status(chr);
 
     if (!s->connected) {
         return len;
@@ -164,12 +134,7 @@ static void pty_chr_state(Chardev *chr, int connected)
     if (!connected) {
         remove_fd_in_watch(chr);
         s->connected = 0;
-        /* (re-)connect poll interval for idle guests: once per second.
-         * We check more frequently in case the guests sends data to
-         * the virtual device linked to our pty. */
-        pty_chr_rearm_timer(chr, 1000);
     } else {
-        pty_chr_timer_cancel(s);
         if (!s->connected) {
             s->connected = 1;
             qemu_chr_be_event(chr, CHR_EVENT_OPENED);
@@ -190,7 +155,6 @@ static void char_pty_finalize(Object *obj)
 
     pty_chr_state(chr, 0);
     object_unref(OBJECT(s->ioc));
-    pty_chr_timer_cancel(s);
     qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
 }
 
@@ -336,7 +300,6 @@ static void char_pty_open(Chardev *chr,
     name = g_strdup_printf("chardev-pty-%s", chr->label);
     qio_channel_set_name(QIO_CHANNEL(s->ioc), name);
     g_free(name);
-    s->timer_src = NULL;
     *be_opened = false;
 }
 
