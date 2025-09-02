@@ -269,6 +269,12 @@ There are two modes to handle address remapping, with different limitations:
 * `-device <name>,bus=<bus>,address=<address>` can be used to attach devices at a specific address
   to one of the three I2C buses. The buses are named `ot-i2c0`, `ot-i2c1`, and `ot-i2c2`.
 
+### USBDEV
+
+* `-chardev pty,id=usbdev` can be used to connect to the usbdev driver.
+
+See the [USBDEV documentation](usbdev.md)] for more details.
+
 ## Useful debugging options
 
 ### Device log traces

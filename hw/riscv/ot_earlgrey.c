@@ -70,6 +70,7 @@
 #include "hw/opentitan/ot_timer.h"
 #include "hw/opentitan/ot_uart.h"
 #include "hw/opentitan/ot_unimp.h"
+#include "hw/opentitan/ot_usbdev.h"
 #include "hw/opentitan/ot_vmapper.h"
 #include "hw/qdev-properties.h"
 #include "hw/riscv/dm.h"
@@ -102,6 +103,8 @@ static void ot_eg_soc_spi_device_configure(
     DeviceState *dev, const IbexDeviceDef *def, DeviceState *parent);
 static void ot_eg_soc_uart_configure(DeviceState *dev, const IbexDeviceDef *def,
                                      DeviceState *parent);
+static void ot_eg_soc_usbdev_configure(
+    DeviceState *dev, const IbexDeviceDef *def, DeviceState *parent);
 
 /* ------------------------------------------------------------------------ */
 /* Constants */
@@ -855,21 +858,41 @@ static const IbexDeviceDef ot_eg_soc_devices[] = {
         ),
     },
     [OT_EG_SOC_DEV_USBDEV] = {
-        .type = TYPE_OT_UNIMP,
-        .cfg = &ibex_unimp_configure,
+        .type = TYPE_OT_USBDEV,
+        .cfg = &ot_eg_soc_usbdev_configure,
         .memmap = MEMMAPENTRIES(
             { .base = 0x40320000u }
         ),
+        .gpio = IBEXGPIOCONNDEFS(
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(0, PLIC, 135),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(1, PLIC, 136),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(2, PLIC, 137),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(3, PLIC, 138),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(4, PLIC, 139),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(5, PLIC, 140),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(6, PLIC, 141),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(7, PLIC, 142),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(8, PLIC, 143),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(9, PLIC, 144),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(10, PLIC, 145),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(11, PLIC, 146),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(12, PLIC, 147),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(13, PLIC, 148),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(14, PLIC, 149),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(15, PLIC, 150),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(16, PLIC, 151),
+            OT_EG_SOC_GPIO_SYSBUS_IRQ(17, PLIC, 152),
+            OT_EG_SOC_GPIO_ALERT(0, 21)
+            /* The VBUS sense pin is handled by a chardev */
+        ),
+        .link = IBEXDEVICELINKDEFS(
+            OT_EG_SOC_DEVLINK("clock-src", CLKMGR)
+        ),
         .prop = IBEXDEVICEPROPDEFS(
             IBEX_DEV_STRING_PROP(OT_COMMON_DEV_ID, "usbdev"),
-            IBEX_DEV_UINT_PROP("size", 0x1000u),
-            IBEX_DEV_UINT_PROP("irq-count", 18u),
-            IBEX_DEV_UINT_PROP("alert-count", 1u),
-            IBEX_DEV_BOOL_PROP("warn-once", true)
+            IBEX_DEV_STRING_PROP("clock-name", "usb"),
+            IBEX_DEV_STRING_PROP("clock-name-aon", "aon")
         ),
-        .gpio = IBEXGPIOCONNDEFS(
-            OT_EG_SOC_GPIO_ALERT(0, 21)
-        )
     },
     [OT_EG_SOC_DEV_PWRMGR] = {
         .type = TYPE_OT_PWRMGR,
@@ -1606,6 +1629,20 @@ static void ot_eg_soc_uart_configure(DeviceState *dev, const IbexDeviceDef *def,
     (void)def;
     (void)parent;
     qdev_prop_set_chr(dev, "chardev", serial_hd(IBEX_GET_INSTANCE_NUM(def)));
+}
+
+static void ot_eg_soc_usbdev_configure(
+    DeviceState *dev, const IbexDeviceDef *def, DeviceState *parent)
+{
+    (void)parent;
+    (void)def;
+
+    Chardev *chr;
+
+    chr = ibex_get_chardev_by_id("usbdev");
+    if (chr) {
+        qdev_prop_set_chr(dev, "chardev", chr);
+    }
 }
 
 /* ------------------------------------------------------------------------ */

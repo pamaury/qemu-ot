@@ -191,6 +191,9 @@ config OT_TIMER
 config OT_UART
     bool
 
+config OT_USBDEV
+    bool
+
 config OT_UNIMP
     bool
 
