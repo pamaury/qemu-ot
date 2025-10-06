@@ -1,0 +1,47 @@
+---
+#------------------------------------------------------------------------------
+# QEMU OpenTitan CI
+#
+# Copyright (c) 2023-2025 Rivos, Inc.
+# SPDX-License-Identifier: Apache License 2.0
+#------------------------------------------------------------------------------
+
+name: Test kernel modules
+on:
+  - pull_request
+  - workflow_dispatch
+jobs:
+  test-usb:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Print kernel config
+        run: |
+          cat /boot/config-`uname -r`
+      - name: Install deps
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y linux-headers-generic
+          mkdir linux
+          cd linux
+          apt-get source linux-image-unsigned-$(uname -r)
+      - name: Build and load dummy_hcd module
+        run: |
+          cd linux
+          cp $(ls | grep linux- | head -n1)/drivers/usb/gadget/udc/dummy_hcd.c dummy_hcd.c
+          cat >Makefile <<'EOF'
+          obj-m := dummy_hcd.o
+          KDIR := /lib/modules/$(shell uname -r)/build
+          PWD := $(shell pwd)
+
+          default:
+          	$(MAKE) -C $(KDIR) M=$(PWD) SUBDIRS=$(PWD) modules
+
+          clean:
+          	$(MAKE) -C $(KDIR) M=$(PWD) SUBDIRS=$(PWD) clean
+          EOF
+          cat Makefile
+          make
+          sudo modprobe udc_core
+          sudo insmod dummy_hcd.ko
+
