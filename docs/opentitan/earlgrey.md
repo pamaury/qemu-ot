@@ -269,9 +269,10 @@ See documentation in [`uart.md`](./uart.md).
 
 ### USBDEV
 
-* `-chardev pty,id=usbdev` can be used to connect to the usbdev driver.
+* `-chardev pty,id=usbdev-cmd` can be used to connect to the usbdev driver (commands).
+* `-chardev pty,id=usbdev-host` can be used to connect to the usbdev driver (host).
 
-See the [USBDEV documentation](usbdev.md)] for more details.
+See the [USBDEV documentation](usbdev.md) for more details.
 
 ## Useful debugging options
 

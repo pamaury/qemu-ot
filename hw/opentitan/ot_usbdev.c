@@ -27,13 +27,16 @@
  * THE SOFTWARE.
  */
 
+/*
+ * OpenTitan has a "zero-time" simulation model in
+ * hw/ip/usbdev/dv/env/usbdev_bfm.sv. This driver makes references to this
+ * behavioural model as "BFM".
+ */
+
 #include "qemu/osdep.h"
 #include "qemu/log.h"
-#include "qemu/module.h"
-#include "qapi/error.h"
 #include "chardev/char-fe.h"
 #include "hw/opentitan/ot_alert.h"
-#include "hw/opentitan/ot_common.h"
 #include "hw/opentitan/ot_usbdev.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/qdev-properties.h"
@@ -221,27 +224,7 @@ REG32(COUNT_ERRORS, 0xa8u)
 #define REGS_COUNT       (R_LAST_REG + 1u)
 #define USBDEV_REGS_SIZE (REGS_COUNT * sizeof(uint32_t))
 
-typedef enum {
-    USBDEV_INTR_PKT_RECEIVED,
-    USBDEV_INTR_PKT_SENT,
-    USBDEV_INTR_DISCONNECTED,
-    USBDEV_INTR_HOST_LOST,
-    USBDEV_INTR_LINK_RESET,
-    USBDEV_INTR_LINK_SUSPEND,
-    USBDEV_INTR_LINK_RESUME,
-    USBDEV_INTR_AV_OUT_EMPTY,
-    USBDEV_INTR_RX_FULL,
-    USBDEV_INTR_AV_OVERFLOW,
-    USBDEV_INTR_LINK_IN_ERR,
-    USBDEV_INTR_RX_CRC_ERR,
-    USBDEV_INTR_RX_PID_ERR,
-    USBDEV_INTR_RX_BITSTUFF_ERR,
-    USBDEV_INTR_FRAME,
-    USBDEV_INTR_POWERED,
-    USBDEV_INTR_LINK_OUT_ERR,
-    USBDEV_INTR_AV_SETUP_EMPTY,
-    USBDEV_INTR_NUM,
-} OtUsbdevInterrupt;
+#define USBDEV_INTR_NUM  18
 
 #define USBDEV_INTR_RW1C_MASK \
     (USBDEV_INTR_DISCONNECTED_MASK | USBDEV_INTR_HOST_LOST_MASK | \
@@ -256,6 +239,9 @@ typedef enum {
     (USBDEV_INTR_RW1C_MASK | USBDEV_INTR_PKT_RECEIVED_MASK | \
      USBDEV_INTR_PKT_SENT_MASK | USBDEV_INTR_AV_OUT_EMPTY_MASK | \
      USBDEV_INTR_RX_FULL_MASK | USBDEV_INTR_AV_SETUP_EMPTY_MASK)
+
+#define USBDEV_USBCTRL_R_MASK \
+    (R_USBCTRL_ENABLE_MASK | R_USBCTRL_DEVICE_ADDRESS_MASK)
 
 static_assert(USBDEV_INTR_MASK == (1u << USBDEV_INTR_NUM) - 1u,
               "Interrupt mask mismatch");
@@ -290,7 +276,29 @@ typedef enum {
      * pending the end of resume signaling.
      */
     OT_USBDEV_LINK_STATE_RESUMING = 6,
+    OT_USBDEV_LINK_STATE_COUNT,
 } OtUsbdevLinkState;
+
+#define LINK_STATE_ENTRY(_name) \
+    [OT_USBDEV_LINK_STATE_##_name] = stringify(_name)
+
+static const char *LINK_STATE_NAME[] = {
+    /* clang-format off */
+    LINK_STATE_ENTRY(DISCONNECTED),
+    LINK_STATE_ENTRY(POWERED),
+    LINK_STATE_ENTRY(POWERED_SUSP),
+    LINK_STATE_ENTRY(ACTIVE),
+    LINK_STATE_ENTRY(SUSPENDED),
+    LINK_STATE_ENTRY(ACTIVE_NOSOF),
+    LINK_STATE_ENTRY(RESUMING),
+    /* clang-format on */
+};
+#undef LINK_STATE_ENTRY
+
+#define LINK_STATE_NAME(_st_) \
+    (((unsigned)(_st_)) < ARRAY_SIZE(LINK_STATE_NAME) ? \
+         LINK_STATE_NAME[(_st_)] : \
+         "?")
 
 struct OtUsbdevClass {
     SysBusDeviceClass parent_class;
@@ -304,6 +312,63 @@ struct OtUsbdevClass {
 static_assert(USBDEV_PARAM_NUM_ALERTS == 1u,
               "This only supports a single alert (fault)");
 
+/*
+ * USB server protocol
+ *
+ * The protocol is documented in docs/opentitan/usbdev.md
+ */
+
+typedef enum {
+    OT_USBDEV_SERVER_CMD_INVALID,
+    OT_USBDEV_SERVER_CMD_HELLO,
+    OT_USBDEV_SERVER_CMD_VBUS_ON,
+    OT_USBDEV_SERVER_CMD_VBUS_OFF,
+    OT_USBDEV_SERVER_CMD_CONNECT,
+    OT_USBDEV_SERVER_CMD_DISCONNECT,
+    OT_USBDEV_SERVER_CMD_RESET,
+    OT_USBDEV_SERVER_CMD_RESUME,
+    OT_USBDEV_SERVER_CMD_SUSPEND,
+} OtUsbdevServerCmd;
+
+typedef struct {
+    uint32_t cmd; /* Command, see OtUsbdevServerCmd */
+    uint32_t size; /* Size, excluding header */
+    uint32_t id; /* Unique ID */
+} OtUsbdevServerPktHdr;
+
+#define OT_USBDEV_SERVER_HELLO_MAGIC "UDCX"
+#define OT_USBDEV_SERVER_MAJOR_VER   1u
+#define OT_USBDEV_SERVER_MINOR_VER   0u
+
+typedef struct {
+    char magic[4];
+    uint16_t major_version;
+    uint16_t minor_version;
+} OtUsbdevServerHelloPkt;
+
+/* State machine for the server receive path */
+typedef enum {
+    /* Wait for packet header */
+    OT_USBDEV_SERVER_RECV_WAIT_HEADER,
+    OT_USBDEV_SERVER_RECV_WAIT_DATA,
+} OtUsbdevServerRecvState;
+
+typedef struct {
+    /* Current state of the receiver */
+    OtUsbdevServerRecvState recv_state;
+    size_t recv_rem; /* Remaining quantity to receive */
+    uint8_t *recv_buf; /* Pointer to buffer where to receive */
+    /* Packet header under reception or processing */
+    OtUsbdevServerPktHdr recv_pkt;
+    /* Packet data under reception or processing */
+    uint8_t *recv_data;
+
+    /* Current state of server */
+    bool client_connected; /* We have a client */
+    bool vbus_connected; /* The host has turned on VBUS */
+    bool hello_done; /* Have received a HELLO? */
+} OtUsbdevServer;
+
 struct OtUsbdevState {
     SysBusDevice parent_obj;
     struct {
@@ -314,20 +379,21 @@ struct OtUsbdevState {
     IbexIRQ irqs[USBDEV_INTR_NUM];
     IbexIRQ alert;
 
-    /* Register content: note that certain read-only fields are not recorded. */
+    /* Register content */
     uint32_t regs[REGS_COUNT];
-    /* Link state: this is not recorded in reg. */
-    OtUsbdevLinkState link_state;
-    /* VBUS sense: this is not recorded in reg. */
-    bool vbus_sense;
+    /* VBUS gate: meaning depends on the vbus_override mode */
+    bool vbus_gate;
 
     /* Buffer content */
     uint32_t buffer[USBDEV_BUFFER_SIZE / sizeof(uint32_t)];
 
-    /* Communication device and buffer. */
-    CharBackend chr;
+    /* Communication device and buffer for management. */
+    CharBackend cmd_chr;
     char cmd_buf[CMD_BUF_SIZE];
     unsigned cmd_buf_pos;
+    /* Communication device for the USB protocol. */
+    CharBackend usb_chr;
+    OtUsbdevServer usb_server;
 
     char *ot_id;
     /* Link to the clkmgr. */
@@ -394,14 +460,13 @@ static const char *REG_NAMES[REGS_COUNT] = {
 #undef REG_NAME_ENTRY
 
 /*
+ * Forward definitions
+ */
+static void ot_usbdev_server_report_connected(OtUsbdevState *s, bool connected);
+
+/*
  * State handling
  */
-static void ot_usbdev_set_vbus_sense(OtUsbdevState *s, bool sense)
-{
-    s->vbus_sense = sense;
-    /* @todo need to update the link state and trigger some events here */
-}
-
 static void ot_usbdev_update_irqs(OtUsbdevState *s)
 {
     uint32_t state_masked =
@@ -410,8 +475,8 @@ static void ot_usbdev_update_irqs(OtUsbdevState *s)
     trace_ot_usbdev_irqs(s->ot_id, s->regs[R_USBDEV_INTR_STATE],
                          s->regs[R_USBDEV_INTR_ENABLE], state_masked);
 
-    for (unsigned irq_index = 0; irq_index < USBDEV_INTR_NUM; irq_index++) {
-        bool level = (state_masked & (1U << irq_index)) != 0;
+    for (unsigned irq_index = 0u; irq_index < USBDEV_INTR_NUM; irq_index++) {
+        bool level = (state_masked & (1U << irq_index)) != 0u;
         ibex_irq_set(&s->irqs[irq_index], level);
     }
 }
@@ -430,6 +495,223 @@ static void ot_usbdev_update_alerts(OtUsbdevState *s)
 }
 
 /*
+ * Determine whether the USBDEV is enabled (ie asserting the pullup).
+ *
+ * @return true if enabled (USBCTRL.ENABLE is set).
+ */
+static bool ot_usbdev_is_enabled(const OtUsbdevState *s)
+{
+    /*
+     * Note: this works even if the device is in reset because
+     * we clear registers on reset entry.
+     */
+    return (bool)FIELD_EX32(s->regs[R_USBCTRL], USBCTRL, ENABLE);
+}
+
+/*
+ * Determine whether VBUS is on.
+ *
+ * @return true if VBUS is present (USBSTAT.SENSE is set).
+ */
+static bool ot_usbdev_has_vbus(const OtUsbdevState *s)
+{
+    /*
+     * Note: always returns 0 when device is in reset.
+     */
+    return FIELD_EX32(s->regs[R_USBSTAT], USBSTAT, SENSE);
+}
+
+/*
+ * Return the current link state.
+ *
+ * @return value of USBSTAT.LINK_STATE.
+ */
+static OtUsbdevLinkState ot_usbdev_get_link_state(const OtUsbdevState *s)
+{
+    unsigned int v = FIELD_EX32(s->regs[R_USBSTAT], USBSTAT, LINK_STATE);
+    /* The SW cannot modify the USBSTAT register but let's be paranoid */
+    g_assert(v <= OT_USBDEV_LINK_STATE_COUNT);
+    return (OtUsbdevLinkState)v;
+}
+
+/*
+ * Change the link state in the USBSTAT register and trace change.
+ *
+ * Note: no events (IRQs, etc) are triggered, this is the caller's
+ * responsibility.
+ */
+static void
+ot_usbdev_set_raw_link_state(OtUsbdevState *s, OtUsbdevLinkState state)
+{
+    OtUsbdevLinkState old_state = ot_usbdev_get_link_state(s);
+
+    if (old_state != state) {
+        trace_ot_usbdev_link_state_changed(s->ot_id, LINK_STATE_NAME(state));
+    }
+
+    s->regs[R_USBSTAT] =
+        FIELD_DP32(s->regs[R_USBSTAT], USBSTAT, LINK_STATE, (uint32_t)state);
+}
+
+/*
+ * Update the device state after a potential VBUS change.
+ *
+ * This function will trigger all necessary state and IRQs changes necessary.
+ * If the device becomes connected/disconnected as a result, the server will
+ * be notified.
+ */
+static void ot_usbdev_update_vbus(OtUsbdevState *s)
+{
+    /* Do nothing if the device is in reset */
+    if (resettable_is_in_reset(OBJECT(s))) {
+        return;
+    }
+
+    /*
+     * In VBUS override mode, VBUS sense is directly equal to
+     * the VBUS gate. Otherwise, it is the AND between the gate
+     * and the host VBUS control.
+     */
+    bool vbus_sense = s->vbus_gate;
+    if (!s->vbus_override) {
+        vbus_sense = vbus_sense && s->usb_server.vbus_connected;
+    }
+
+    bool old_vbus_sense = (bool)FIELD_EX32(s->regs[R_USBSTAT], USBSTAT, SENSE);
+    if (old_vbus_sense == vbus_sense) {
+        return;
+    }
+
+    trace_ot_usbdev_vbus_changed(s->ot_id, vbus_sense);
+
+    s->regs[R_USBSTAT] =
+        FIELD_DP32(s->regs[R_USBSTAT], USBSTAT, SENSE, vbus_sense);
+
+    /* VBUS was turned on */
+    if (vbus_sense) {
+        /* See BFM (bus_connect) */
+
+        /* If we end up in a non-disconnected state here, something is very wrong */
+        g_assert(ot_usbdev_get_link_state(s) ==
+                 OT_USBDEV_LINK_STATE_DISCONNECTED);
+        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_POWERED_MASK;
+
+        if (ot_usbdev_is_enabled(s)) {
+            ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_POWERED);
+            ot_usbdev_server_report_connected(s, true);
+        }
+    }
+    /* VBUS was turned off */
+    else {
+        /* See BFM (bus_disconnect) */
+        g_assert(ot_usbdev_get_link_state(s) !=
+                 OT_USBDEV_LINK_STATE_DISCONNECTED);
+        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_DISCONNECTED);
+        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_DISCONNECTED_MASK;
+        s->regs[R_USBCTRL] =
+            FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
+    }
+
+    ot_usbdev_update_irqs(s);
+}
+
+/*
+ * Update the VBUS gate.
+ *
+ * Changes will trigger events (see ot_usbdev_update_vbus).
+ *
+ * @gate New value of the gate.
+ */
+static void ot_usbdev_set_vbus_gate(OtUsbdevState *s, bool gate)
+{
+    s->vbus_gate = gate;
+
+    ot_usbdev_update_vbus(s);
+}
+
+/*
+ * Simulate a link reset.
+ *
+ * This function will trigger all necessary state and IRQs changes necessary to
+ * perform a link reset.
+ *
+ * @todo document what happens to transfers when done
+ */
+static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
+{
+    g_assert(!resettable_is_in_reset(OBJECT(s)));
+
+    /* We cannot simulate a reset if the device is disconnected! */
+    if (ot_usbdev_get_link_state(s) == OT_USBDEV_LINK_STATE_DISCONNECTED) {
+        error_report("%s: %s Link reset while disconnected?!", __func__,
+                     s->ot_id);
+        return;
+    }
+
+    /* See BFM (bus_reset) */
+    s->regs[R_USBCTRL] =
+        FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
+    s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_RESET_MASK;
+    /* @todo cancel all transfers */
+
+    if (ot_usbdev_has_vbus(s) && ot_usbdev_is_enabled(s)) {
+        /* @todo BFM has some extra state processing but it seems incorrect */
+        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE_NOSOF);
+    }
+    ot_usbdev_update_irqs(s);
+}
+
+/*
+ * Update the value of the USBCTRL register.
+ *
+ * This function will update the USBCTRL register after a write and
+ * trigger the necessary changes if the ENABLE bit is changed. If
+ * as a result of this change the device becomes (dis)connected,
+ * the server will be notified.
+ *
+ * @val32 New value
+ */
+static void ot_usbdev_write_usbctrl(OtUsbdevState *s, uint32_t val32)
+{
+    bool old_enable = ot_usbdev_is_enabled(s);
+
+    /* @todo Handle resume_link_active eventually, this is a W/O field */
+    s->regs[R_USBCTRL] = val32 & USBDEV_USBCTRL_R_MASK;
+
+    bool enable = ot_usbdev_is_enabled(s);
+    if (enable == old_enable) {
+        return;
+    }
+
+    trace_ot_usbdev_enable_changed(s->ot_id, enable);
+
+    /* Device has been enabled */
+    if (enable) {
+        /* See BFM (set_enable) */
+        g_assert(ot_usbdev_get_link_state(s) ==
+                 OT_USBDEV_LINK_STATE_DISCONNECTED);
+        if (ot_usbdev_has_vbus(s)) {
+            ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_POWERED);
+            ot_usbdev_server_report_connected(s, true);
+        }
+        /* @todo Handle FIFO interrupts */
+    } else {
+        /* See BFM (set_enable) */
+        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_DISCONNECTED);
+        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_DISCONNECTED_MASK;
+        s->regs[R_USBCTRL] =
+            FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
+
+        if (ot_usbdev_has_vbus(s)) {
+            ot_usbdev_server_report_connected(s, false);
+        }
+        /* @todo Handle FIFO interrupts */
+    }
+
+    ot_usbdev_update_irqs(s);
+}
+
+/*
  * Register read/write handling
  */
 
@@ -441,26 +723,11 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
 
     hwaddr reg = R32_OFF(addr);
     switch (reg) {
+    /* Reads with no side-effects */
+    case R_PHY_CONFIG:
+    case R_USBSTAT:
     case R_USBDEV_INTR_STATE:
     case R_USBDEV_INTR_ENABLE:
-        val32 = s->regs[reg];
-        break;
-    case R_USBDEV_INTR_TEST:
-    case R_ALERT_TEST:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: %s Read to W/O register 0x%02" HWADDR_PRIx " (%s)\n",
-                      __func__, s->ot_id, addr, REG_NAME(reg));
-        val32 = 0;
-        break;
-    case R_USBSTAT:
-        /*
-         * For now, there is no host so we always always operate in
-         * vbus-override mode.
-         * @todo Report other statuses.
-         */
-        val32 = FIELD_DP32(0u, USBSTAT, LINK_STATE, s->link_state);
-        val32 = FIELD_DP32(val32, USBSTAT, SENSE, (uint32_t)s->vbus_sense);
-        break;
     case R_USBCTRL:
     case R_EP_OUT_ENABLE:
     case R_EP_IN_ENABLE:
@@ -491,7 +758,6 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
     case R_IN_DATA_TOGGLE:
     case R_PHY_PINS_SENSE:
     case R_PHY_PINS_DRIVE:
-    case R_PHY_CONFIG:
     case R_WAKE_CONTROL:
     case R_WAKE_EVENTS:
     case R_FIFO_CTRL:
@@ -499,14 +765,19 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
     case R_COUNT_IN:
     case R_COUNT_NODATA_IN:
     case R_COUNT_ERRORS:
-        qemu_log_mask(LOG_UNIMP, "%s: %s %s is not supported\n", __func__,
-                      s->ot_id, REG_NAME(reg));
-        val32 = 0;
+        val32 = s->regs[reg];
+        break;
+    case R_USBDEV_INTR_TEST:
+    case R_ALERT_TEST:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: %s Read to W/O register 0x%02" HWADDR_PRIx " (%s)\n",
+                      __func__, s->ot_id, addr, REG_NAME(reg));
+        val32 = 0u;
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: %s Bad offset 0x%" HWADDR_PRIx "\n",
                       __func__, s->ot_id, addr);
-        val32 = 0;
+        val32 = 0u;
         break;
     }
 
@@ -565,7 +836,14 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
                       " (%s)\n",
                       __func__, s->ot_id, addr, REG_NAME(reg));
         break;
+    /* Writes without side-effects */
+    case R_PHY_CONFIG:
+        /* @todo mask against actual fields? */
+        s->regs[R_PHY_CONFIG] = val32;
+        break;
     case R_USBCTRL:
+        ot_usbdev_write_usbctrl(s, val32);
+        break;
     case R_EP_OUT_ENABLE:
     case R_EP_IN_ENABLE:
     case R_AVOUTBUFFER:
@@ -595,7 +873,6 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
     case R_IN_DATA_TOGGLE:
     case R_PHY_PINS_SENSE:
     case R_PHY_PINS_DRIVE:
-    case R_PHY_CONFIG:
     case R_WAKE_CONTROL:
     case R_WAKE_EVENTS:
     case R_FIFO_CTRL:
@@ -603,6 +880,7 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
     case R_COUNT_IN:
     case R_COUNT_NODATA_IN:
     case R_COUNT_ERRORS:
+        s->regs[reg] = val32;
         qemu_log_mask(LOG_UNIMP, "%s: %s: %s is not supported\n", __func__,
                       s->ot_id, REG_NAME(reg));
         break;
@@ -642,10 +920,321 @@ static void ot_usbdev_buffer_write(void *opaque, hwaddr addr, uint64_t val64,
 }
 
 /*
+ * USB server
+ */
+static void ot_usbdev_server_reset_recv_state(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    /* cleanup previous state */
+    g_free(server->recv_data);
+    server->recv_data = NULL;
+
+    server->recv_state = OT_USBDEV_SERVER_RECV_WAIT_HEADER;
+    server->recv_rem = sizeof(server->recv_pkt);
+    server->recv_buf = (uint8_t *)&server->recv_pkt;
+}
+
+/*
+ * Open a session with the server.
+ *
+ * This function will reset the server state to start a new session.
+ */
+static void ot_usbdev_server_open(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+    server->client_connected = true;
+    server->vbus_connected = false;
+    server->hello_done = false;
+    ot_usbdev_server_reset_recv_state(s);
+
+    ot_usbdev_update_vbus(s);
+}
+
+/*
+ * Close a session with the server.
+ *
+ * In particular, if VBUS is still on, it will be turned off by this call,
+ * which can trigger events on the device side.
+ */
+static void ot_usbdev_server_close(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+    server->client_connected = false;
+    server->vbus_connected = false;
+
+    ot_usbdev_update_vbus(s);
+}
+
+/*
+ * Send a message to the client.
+ *
+ * @todo clarify blocking/non-blocking
+ */
+static void ot_usbdev_server_write_packet(OtUsbdevState *s,
+                                          OtUsbdevServerCmd cmd, uint32_t id,
+                                          const void *data, size_t size)
+{
+    /*
+     * @todo Update this to handle partial writes, by adding them to a queue and
+     * using a watch callback
+     */
+    const OtUsbdevServerPktHdr hdr = {
+        .cmd = cmd,
+        .size = size,
+        .id = id,
+    };
+    int res = qemu_chr_fe_write(&s->usb_chr, (const uint8_t *)&hdr, sizeof(hdr));
+    if (res < sizeof(hdr)) {
+        qemu_log_mask(LOG_UNIMP, "%s: %s server: unhandled partial write\n",
+                      __func__, s->ot_id);
+        return;
+    }
+    if (size > 0u) {
+        res = qemu_chr_fe_write(&s->usb_chr, (const uint8_t *)data, (int)size);
+        if (res < size) {
+            qemu_log_mask(LOG_UNIMP, "%s: %s server: unhandled partial write\n",
+                          __func__, s->ot_id);
+            return;
+        }
+    }
+}
+
+/*
+ * Report a (dis)connection event to the client.
+ *
+ * Send a message to the client to notify the connection status change.
+ * Note that this function does not keep track of the current status and will
+ * send a message if the new status is the same as the old one.
+ *
+ * @connected New connection status
+ */
+void ot_usbdev_server_report_connected(OtUsbdevState *s, bool connected)
+{
+    trace_ot_usbdev_server_report_connected(s->ot_id, connected);
+
+    /* Nothing to do if no client is connected */
+    if (!s->usb_server.client_connected) {
+        return;
+    }
+
+    /* @todo clarify ID to use */
+    ot_usbdev_server_write_packet(s,
+                                  connected ? OT_USBDEV_SERVER_CMD_CONNECT :
+                                              OT_USBDEV_SERVER_CMD_DISCONNECT,
+                                  0u, NULL, 0u);
+}
+
+/*
+ * Process a HELLO packet from the client and send one back.
+ *
+ * After this function, the server will be ready to receive messages from
+ * the client, unless the packet was invalid in which case the server will
+ * keep expecting a valid HELLO packet.
+ */
+static void ot_usbdev_server_process_hello(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->hello_done) {
+        error_report("%s: %s server: unexpected HELLO\n", __func__, s->ot_id);
+        /* Not a fatal error */
+    }
+    if (server->recv_pkt.size != sizeof(OtUsbdevServerHelloPkt)) {
+        error_report("%s: %s server: HELLO packet with unexpected payload "
+                     "size %u, ignoring packet\n",
+                     __func__, s->ot_id, server->recv_pkt.size);
+        return;
+    }
+    /*
+     * @todo maybe recover packet ID and drop any packet with ID smaller than
+     * the last hello?
+     */
+    OtUsbdevServerHelloPkt hello;
+    memcpy(&hello, server->recv_data, sizeof(OtUsbdevServerHelloPkt));
+    if (memcmp(hello.magic, OT_USBDEV_SERVER_HELLO_MAGIC,
+               sizeof(hello.magic)) != 0) {
+        error_report("%s: %s server: HELLO packet with unexpected magic value "
+                     "%.4s, ignoring packet\n",
+                     __func__, s->ot_id, hello.magic);
+        return;
+    }
+    if (hello.major_version != OT_USBDEV_SERVER_MAJOR_VER ||
+        hello.minor_version != OT_USBDEV_SERVER_MINOR_VER) {
+        error_report("%s: %s server: HELLO packet with unexpected version "
+                     "version %d.%d, ignoring packet\n",
+                     __func__, s->ot_id, hello.major_version,
+                     hello.minor_version);
+        return;
+    }
+    server->hello_done = true;
+
+    trace_ot_usbdev_server_hello(s->ot_id, hello.major_version,
+                                 hello.minor_version);
+
+    /* Answer back */
+    OtUsbdevServerHelloPkt resp_hello;
+    memcpy(&resp_hello.magic, OT_USBDEV_SERVER_HELLO_MAGIC,
+           sizeof(resp_hello.magic));
+    resp_hello.major_version = OT_USBDEV_SERVER_MAJOR_VER;
+    resp_hello.minor_version = OT_USBDEV_SERVER_MINOR_VER;
+    ot_usbdev_server_write_packet(s, OT_USBDEV_SERVER_CMD_HELLO,
+                                  server->recv_pkt.id, (const void *)&resp_hello,
+                                  sizeof(resp_hello));
+}
+
+static void ot_usbdev_server_process_reset(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->recv_pkt.size != 0u) {
+        error_report("%s: %s server: RESET packet with unexpected payload, "
+                     "ignoring packet\n",
+                     __func__, s->ot_id);
+        return;
+    }
+    /* Ignore if device is not enabled */
+    if (resettable_is_in_reset(OBJECT(s))) {
+        error_report(
+            "%s: %s server: RESET when device is in reset, ignoring packet\n",
+            __func__, s->ot_id);
+        return;
+    }
+
+    ot_usbdev_simulate_link_reset(s);
+}
+
+static void ot_usbdev_server_process_vbus_changed(OtUsbdevState *s, bool vbus)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->recv_pkt.size != 0u) {
+        error_report("%s: %s server: VBUS_ON/OFF packet with unexpected "
+                     "payload, ignoring packet\n",
+                     __func__, s->ot_id);
+        return;
+    }
+
+    server->vbus_connected = vbus;
+    ot_usbdev_update_vbus(s);
+}
+
+static void ot_usbdev_server_process_packet(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    /*
+     * Important note: the ->recv_data pointer is freed in
+     * ot_usbdev_server_reset_recv_state() if left non-NULL. The code below must
+     * either make a copy of the data or take ownership of the pointer and set
+     * ->recv_data to NULL.
+     */
+
+    /* If HELLO hasn't been received yet, ignore everything else */
+    if (server->recv_pkt.cmd != OT_USBDEV_SERVER_CMD_HELLO &&
+        !server->hello_done) {
+        error_report("%s: %s server: unexpected command %u before HELLO\n",
+                     __func__, s->ot_id, server->recv_pkt.cmd);
+        /* Do not process packet */
+        return;
+    }
+
+    switch (server->recv_pkt.cmd) {
+    case OT_USBDEV_SERVER_CMD_HELLO:
+        ot_usbdev_server_process_hello(s);
+        break;
+    case OT_USBDEV_SERVER_CMD_RESET:
+        ot_usbdev_server_process_reset(s);
+        break;
+    case OT_USBDEV_SERVER_CMD_VBUS_ON:
+        ot_usbdev_server_process_vbus_changed(s, true);
+        break;
+    case OT_USBDEV_SERVER_CMD_VBUS_OFF:
+        ot_usbdev_server_process_vbus_changed(s, false);
+        break;
+    default:
+        error_report("%s: %s server: unknown packet type %u, ignoring packet\n",
+                     __func__, s->ot_id, server->recv_pkt.cmd);
+        break;
+    }
+
+    ot_usbdev_server_reset_recv_state(s);
+}
+
+static void ot_usbdev_server_advance_recv_state(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->recv_state == OT_USBDEV_SERVER_RECV_WAIT_HEADER) {
+        /* We received a header, now receive data if necessary */
+        if (server->recv_pkt.size > 0u) {
+            /* @todo have some bound on allocation size here? */
+            server->recv_data = g_malloc(server->recv_pkt.size);
+            server->recv_rem = server->recv_pkt.size;
+            server->recv_buf = (uint8_t *)server->recv_data;
+            server->recv_state = OT_USBDEV_SERVER_RECV_WAIT_DATA;
+        } else {
+            /* Process packet */
+            ot_usbdev_server_process_packet(s);
+        }
+    } else if (server->recv_state == OT_USBDEV_SERVER_RECV_WAIT_DATA) {
+        /* Process packet */
+        ot_usbdev_server_process_packet(s);
+    } else {
+        g_assert_not_reached();
+    }
+}
+
+static int ot_usbdev_chr_usb_can_receive(void *opaque)
+{
+    OtUsbdevState *s = opaque;
+
+    /* Return remaining size in the buffer. */
+    return (int)s->usb_server.recv_rem;
+}
+
+static void ot_usbdev_chr_usb_receive(void *opaque, const uint8_t *buf,
+                                      int size)
+{
+    OtUsbdevState *s = opaque;
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (size > server->recv_rem) {
+        error_report("%s: %s: Received too much data on the usb chardev",
+                     __func__, s->ot_id);
+        return;
+    }
+    /* Copy data at the end of the buffer. */
+    memcpy(server->recv_buf, buf, (size_t)size);
+    server->recv_buf += size;
+    server->recv_rem -= size;
+
+    /* Advance state if done */
+    if (server->recv_rem == 0u) {
+        ot_usbdev_server_advance_recv_state(s);
+    }
+}
+
+static void ot_usbdev_chr_usb_event_handler(void *opaque, QEMUChrEvent event)
+{
+    OtUsbdevState *s = opaque;
+
+    trace_ot_usbdev_chr_usb_event_handler(s->ot_id, event);
+
+    if (event == CHR_EVENT_OPENED) {
+        ot_usbdev_server_open(s);
+    }
+
+    if (event == CHR_EVENT_CLOSED) {
+        ot_usbdev_server_close(s);
+    }
+}
+
+/*
  * Communication device handling
  */
 
-static int ot_usbdev_chr_can_receive(void *opaque)
+static int ot_usbdev_chr_cmd_can_receive(void *opaque)
 {
     OtUsbdevState *s = opaque;
 
@@ -665,21 +1254,23 @@ static void ot_usbdev_chr_process_cmd(OtUsbdevState *s, char *cmd,
     trace_ot_usbdev_chr_process_cmd(s->ot_id, cmd);
 
     if (strncmp(cmd, "vbus_on", cmd_size) == 0) {
-        ot_usbdev_set_vbus_sense(s, true);
+        ot_usbdev_set_vbus_gate(s, true);
     } else if (strncmp(cmd, "vbus_off", cmd_size) == 0) {
-        ot_usbdev_set_vbus_sense(s, false);
+        ot_usbdev_set_vbus_gate(s, false);
     } else {
         qemu_log_mask(LOG_UNIMP, "%s: %s: unsupported command %s\n", __func__,
                       s->ot_id, cmd);
     }
 }
 
-static void ot_usbdev_chr_receive(void *opaque, const uint8_t *buf, int size)
+static void ot_usbdev_chr_cmd_receive(void *opaque, const uint8_t *buf,
+                                      int size)
 {
     OtUsbdevState *s = opaque;
 
     if (s->cmd_buf_pos + (unsigned)size > sizeof(s->cmd_buf)) {
-        error_report("%s: %s: Unexpected chardev receive", __func__, s->ot_id);
+        error_report("%s: %s: Received too much data on the cmd chardev",
+                     __func__, s->ot_id);
         return;
     }
     /* Copy data at the end of the buffer. */
@@ -736,7 +1327,11 @@ static Property ot_usbdev_properties[] = {
      * must be terminated by a newline. See ot_usbdev_chr_process_cmd for
      * the list of supported devices.
      */
-    DEFINE_PROP_CHR("chardev", OtUsbdevState, chr),
+    DEFINE_PROP_CHR("chardev-cmd", OtUsbdevState, cmd_chr),
+    /*
+     * Communication device used to emulate a USB host.
+     */
+    DEFINE_PROP_CHR("chardev-usb", OtUsbdevState, usb_chr),
     /* VBUS control mode. */
     DEFINE_PROP_BOOL("vbus-override", OtUsbdevState, vbus_override, false),
     DEFINE_PROP_END_OF_LIST(),
@@ -748,12 +1343,23 @@ static void ot_usbdev_realize(DeviceState *dev, Error **errp)
     (void)errp;
 
     /* @todo: clarify if we need to track events/backend changes. */
-    qemu_chr_fe_set_handlers(&s->chr, ot_usbdev_chr_can_receive,
-                             ot_usbdev_chr_receive, NULL, NULL, s, NULL, true);
+    qemu_chr_fe_set_handlers(&s->cmd_chr, &ot_usbdev_chr_cmd_can_receive,
+                             &ot_usbdev_chr_cmd_receive, NULL, NULL, s, NULL,
+                             true);
+
+    qemu_chr_fe_set_handlers(&s->usb_chr, &ot_usbdev_chr_usb_can_receive,
+                             &ot_usbdev_chr_usb_receive,
+                             &ot_usbdev_chr_usb_event_handler, NULL, s, NULL,
+                             true);
 
     g_assert(s->ot_id);
     g_assert(s->usbclk_name);
     g_assert(s->aonclk_name);
+
+    /* If not in VBUS override mode, the VBUS gate starts on by default. */
+    if (!s->vbus_override) {
+        s->vbus_gate = true;
+    }
 }
 
 /*
@@ -773,17 +1379,34 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
 
     /* @todo cancel everything here. */
 
+    /* See BFM (dut_reset) */
     memset(s->regs, 0, sizeof(s->regs));
-    s->link_state = OT_USBDEV_LINK_STATE_DISCONNECTED;
-
+    /*
+     * @todo The BFM says that 'Disconnected' is held at 1 during IP
+     * reset, need to investigate this detail.
+     */
     ot_usbdev_update_irqs(s);
+}
+
+static void ot_usbdev_reset_exit(Object *obj, ResetType type)
+{
+    OtUsbdevClass *c = OT_USBDEV_GET_CLASS(obj);
+    OtUsbdevState *s = OT_USBDEV(obj);
+
+    trace_ot_usbdev_reset(s->ot_id, "exit");
+
+    if (c->parent_phases.exit) {
+        c->parent_phases.exit(obj, type);
+    }
+
+    ot_usbdev_update_vbus(s);
 }
 
 static void ot_usbdev_init(Object *obj)
 {
     OtUsbdevState *s = OT_USBDEV(obj);
 
-    for (unsigned idx = 0; idx < ARRAY_SIZE(s->irqs); idx++) {
+    for (unsigned idx = 0u; idx < ARRAY_SIZE(s->irqs); idx++) {
         ibex_sysbus_init_irq(obj, &s->irqs[idx]);
     }
     ibex_qdev_init_irq(obj, &s->alert, OT_DEVICE_ALERT);
@@ -799,8 +1422,6 @@ static void ot_usbdev_init(Object *obj)
                           TYPE_OT_USBDEV ".buffer", USBDEV_BUFFER_SIZE);
     memory_region_add_subregion(&s->mmio.main, USBDEV_BUFFER_OFFSET,
                                 &s->mmio.buffer);
-
-    s->vbus_sense = false;
 }
 
 static void ot_usbdev_class_init(ObjectClass *klass, void *data)
@@ -815,7 +1436,8 @@ static void ot_usbdev_class_init(ObjectClass *klass, void *data)
 
     ResettableClass *rc = RESETTABLE_CLASS(klass);
     OtUsbdevClass *uc = OT_USBDEV_CLASS(klass);
-    resettable_class_set_parent_phases(rc, &ot_usbdev_reset_enter, NULL, NULL,
+    resettable_class_set_parent_phases(rc, &ot_usbdev_reset_enter, NULL,
+                                       &ot_usbdev_reset_exit,
                                        &uc->parent_phases);
 }
 

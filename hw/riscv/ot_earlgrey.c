@@ -1638,9 +1638,13 @@ static void ot_eg_soc_usbdev_configure(
 
     Chardev *chr;
 
-    chr = ibex_get_chardev_by_id("usbdev");
+    chr = ibex_get_chardev_by_id("usbdev-cmd");
     if (chr) {
-        qdev_prop_set_chr(dev, "chardev", chr);
+        qdev_prop_set_chr(dev, "chardev-cmd", chr);
+    }
+    chr = ibex_get_chardev_by_id("usbdev-host");
+    if (chr) {
+        qdev_prop_set_chr(dev, "chardev-usb", chr);
     }
 }
 
