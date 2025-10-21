@@ -224,7 +224,7 @@ REG32(COUNT_ERRORS, 0xa8u)
 #define REGS_COUNT       (R_LAST_REG + 1u)
 #define USBDEV_REGS_SIZE (REGS_COUNT * sizeof(uint32_t))
 
-#define USBDEV_INTR_NUM  18
+#define USBDEV_INTR_NUM 18u
 
 #define USBDEV_INTR_RW1C_MASK \
     (USBDEV_INTR_DISCONNECTED_MASK | USBDEV_INTR_HOST_LOST_MASK | \
@@ -591,7 +591,10 @@ static void ot_usbdev_update_vbus(OtUsbdevState *s)
     if (vbus_sense) {
         /* See BFM (bus_connect) */
 
-        /* If we end up in a non-disconnected state here, something is very wrong */
+        /*
+         * If we end up in a non-disconnected state here, something is very
+         * wrong
+         */
         g_assert(ot_usbdev_get_link_state(s) ==
                  OT_USBDEV_LINK_STATE_DISCONNECTED);
         s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_POWERED_MASK;
@@ -984,7 +987,8 @@ static void ot_usbdev_server_write_packet(OtUsbdevState *s,
         .size = size,
         .id = id,
     };
-    int res = qemu_chr_fe_write(&s->usb_chr, (const uint8_t *)&hdr, sizeof(hdr));
+    int res =
+        qemu_chr_fe_write(&s->usb_chr, (const uint8_t *)&hdr, sizeof(hdr));
     if (res < sizeof(hdr)) {
         qemu_log_mask(LOG_UNIMP, "%s: %s server: unhandled partial write\n",
                       __func__, s->ot_id);
@@ -1079,7 +1083,8 @@ static void ot_usbdev_server_process_hello(OtUsbdevState *s)
     resp_hello.major_version = OT_USBDEV_SERVER_MAJOR_VER;
     resp_hello.minor_version = OT_USBDEV_SERVER_MINOR_VER;
     ot_usbdev_server_write_packet(s, OT_USBDEV_SERVER_CMD_HELLO,
-                                  server->recv_pkt.id, (const void *)&resp_hello,
+                                  server->recv_pkt.id,
+                                  (const void *)&resp_hello,
                                   sizeof(resp_hello));
 }
 
