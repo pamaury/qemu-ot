@@ -61,10 +61,7 @@ format:
     - qemu_ot
   stage: build
   script:
-    - scripts/opentitan/ot-format.sh --ci -i
-    - git status -s
-    - test -z "$(git status -s)" || git diff
-    - test -z "$(git status -s)"
+    - scripts/opentitan/ot-format.sh --ci --Werror --dry-run
 
 tidy:
   tags:
