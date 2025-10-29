@@ -34,9 +34,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/fifo8.h"
 #include "qemu/log.h"
 #include "chardev/char-fe.h"
 #include "hw/opentitan/ot_alert.h"
+#include "hw/opentitan/ot_fifo32.h"
 #include "hw/opentitan/ot_usbdev.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/qdev-properties.h"
@@ -49,6 +51,19 @@
 #define USBDEV_PARAM_N_ENDPOINTS 12u
 #define USBDEV_PARAM_NUM_ALERTS  1u
 #define USBDEV_PARAM_REG_WIDTH   32u
+
+/*
+ * The following are not parameters of the IP but hardcoded
+ * constants in the RTL.
+ */
+#define OT_USBDEV_RX_FIFO_DEPTH       8u
+#define OT_USBDEV_AV_SETUP_FIFO_DEPTH 4u
+#define OT_USBDEV_AV_OUT_FIFO_DEPTH   8u
+#define OT_USBDEV_MAX_PACKET_SIZE     64u
+#define OT_USBDEV_BUFFER_COUNT        32u
+
+/* Standard constants */
+#define OT_USBDEV_SETUP_PACKET_SIZE 8u
 
 /* NOLINTNEXTLINE(misc-redundant-expression) */
 static_assert(USBDEV_PARAM_N_ENDPOINTS == 12u,
@@ -243,6 +258,8 @@ REG32(COUNT_ERRORS, 0xa8u)
 #define USBDEV_USBCTRL_R_MASK \
     (R_USBCTRL_ENABLE_MASK | R_USBCTRL_DEVICE_ADDRESS_MASK)
 
+#define USBDEV_CONFIGIN_RW1C_MASK (CONFIGIN_PEND_MASK | CONFIGIN_SENDING_MASK)
+
 static_assert(USBDEV_INTR_MASK == (1u << USBDEV_INTR_NUM) - 1u,
               "Interrupt mask mismatch");
 
@@ -250,6 +267,10 @@ static_assert(USBDEV_INTR_MASK == (1u << USBDEV_INTR_NUM) - 1u,
 #define USBDEV_REGS_OFFSET   0u
 #define USBDEV_BUFFER_OFFSET 0x800u
 #define USBDEV_BUFFER_SIZE   0x800u
+
+static_assert(OT_USBDEV_MAX_PACKET_SIZE * OT_USBDEV_BUFFER_COUNT ==
+                  USBDEV_BUFFER_SIZE,
+              "USBDEV buffer size mismatch");
 
 /*
  * Link state: this is the register field value, which we also use to
@@ -328,6 +349,9 @@ typedef enum {
     OT_USBDEV_SERVER_CMD_RESET,
     OT_USBDEV_SERVER_CMD_RESUME,
     OT_USBDEV_SERVER_CMD_SUSPEND,
+    OT_USBDEV_SERVER_CMD_SETUP,
+    OT_USBDEV_SERVER_CMD_TRANSFER,
+    OT_USBDEV_SERVER_CMD_COMPLETE,
 } OtUsbdevServerCmd;
 
 typedef struct {
@@ -335,6 +359,9 @@ typedef struct {
     uint32_t size; /* Size, excluding header */
     uint32_t id; /* Unique ID */
 } OtUsbdevServerPktHdr;
+
+static_assert(sizeof(OtUsbdevServerPktHdr) == 12u,
+              "Packet header has the wrong size");
 
 #define OT_USBDEV_SERVER_HELLO_MAGIC "UDCX"
 #define OT_USBDEV_SERVER_MAJOR_VER   1u
@@ -346,12 +373,101 @@ typedef struct {
     uint16_t minor_version;
 } OtUsbdevServerHelloPkt;
 
+static_assert(sizeof(OtUsbdevServerHelloPkt) == 8u,
+              "Hello packet has the wrong size");
+
+typedef struct {
+    uint8_t address;
+    uint8_t endpoint;
+    uint8_t reserved[2];
+    uint8_t setup[OT_USBDEV_SETUP_PACKET_SIZE];
+} OtUsbdevServerSetupPkt;
+
+static_assert(sizeof(OtUsbdevServerSetupPkt) == 12u,
+              "Setup packet has the wrong size");
+
+#define OT_USBDEV_EP_DIR_IN   0x80u
+#define OT_USBDEV_EP_NUM_MASK 0x7fu
+
+typedef enum {
+    OT_USBDEV_SERVER_FLAG_ZLP = 1u << 0u,
+} OtUsbdevServerTransferFlags;
+
+typedef struct {
+    uint8_t address;
+    uint8_t endpoint;
+    uint16_t packet_size;
+    uint8_t flags;
+    uint8_t reserved[3];
+    uint32_t transfer_size;
+} OtUsbdevServerTransferPkt;
+
+static_assert(sizeof(OtUsbdevServerTransferPkt) == 12u,
+              "Transfer packet has the wrong size");
+
+typedef enum {
+    OT_USBDEV_SERVER_STATUS_SUCCESS,
+    OT_USBDEV_SERVER_STATUS_STALLED,
+    OT_USBDEV_SERVER_STATUS_CANCELLED,
+    OT_USBDEV_SERVER_STATUS_ERROR,
+} OtUsbdevServerTransferStatus;
+
+#define XFER_STATUS_ENTRY(_name) \
+    [OT_USBDEV_SERVER_STATUS_##_name] = stringify(_name)
+
+static const char *XFER_STATUS_NAME[] = {
+    /* clang-format off */
+    XFER_STATUS_ENTRY(SUCCESS),
+    XFER_STATUS_ENTRY(STALLED),
+    XFER_STATUS_ENTRY(CANCELLED),
+    XFER_STATUS_ENTRY(ERROR),
+    /* clang-format on */
+};
+#undef XFER_STATUS_ENTRY
+
+#define XFER_STATUS_NAME(_st_) \
+    (((unsigned)(_st_)) < ARRAY_SIZE(XFER_STATUS_NAME) ? \
+         XFER_STATUS_NAME[(_st_)] : \
+         "?")
+
+typedef struct {
+    uint8_t status;
+    uint8_t reserved[3];
+    uint32_t transfer_size;
+} OtUsbdevServerCompletePkt;
+
 /* State machine for the server receive path */
 typedef enum {
     /* Wait for packet header */
     OT_USBDEV_SERVER_RECV_WAIT_HEADER,
     OT_USBDEV_SERVER_RECV_WAIT_DATA,
 } OtUsbdevServerRecvState;
+
+typedef struct {
+    bool pending; /* Is there a transfer pending? */
+    uint32_t id; /* ID of the transfer */
+    uint32_t xfer_len; /* Maximum length of the transfer */
+    uint8_t *xfer_buf; /* Buffer allocated to hold the data */
+    uint16_t max_packet_size; /* Maximum packet size */
+    uint32_t recv_rem; /* Remaining quantity to receive */
+    uint8_t *recv_buf; /* Pointer to buffer where to receive */
+} OtUsbdevServerEpInXfer;
+
+typedef struct {
+    bool pending; /* Is there a transfer pending? */
+    bool send_zlp; /* Send a ZLP */
+    uint32_t id; /* ID of the transfer */
+    uint32_t xfer_len; /* Length of the transfer */
+    uint8_t *xfer_buf; /* Buffer allocated to hold the data */
+    uint16_t max_packet_size; /* Maximum packet size */
+    uint32_t send_rem; /* Remaining quantity to send */
+    uint8_t *send_buf; /* Pointer to buffer where to send */
+} OtUsbdevServerEpOutXfer;
+
+typedef struct {
+    OtUsbdevServerEpInXfer in;
+    OtUsbdevServerEpOutXfer out;
+} OtUsbdevServerEpXfer;
 
 typedef struct {
     /* Current state of the receiver */
@@ -362,6 +478,9 @@ typedef struct {
     OtUsbdevServerPktHdr recv_pkt;
     /* Packet data under reception or processing */
     uint8_t *recv_data;
+
+    /* endpoint transfers in progress */
+    OtUsbdevServerEpXfer ep[USBDEV_PARAM_N_ENDPOINTS];
 
     /* Current state of server */
     bool client_connected; /* We have a client */
@@ -383,6 +502,18 @@ struct OtUsbdevState {
     uint32_t regs[REGS_COUNT];
     /* VBUS gate: meaning depends on the vbus_override mode */
     bool vbus_gate;
+
+    /*
+     * Content of the RX FIFO: each entry is encoded like the
+     * RXFIFO register.
+     */
+    OtFifo32 rx_fifo;
+    /*
+     * Content of the available SETUP and OUT buffer FIFOs:
+     * each entry is a buffer ID.
+     */
+    Fifo8 av_setup_fifo;
+    Fifo8 av_out_fifo;
 
     /* Buffer content */
     uint32_t buffer[USBDEV_BUFFER_SIZE / sizeof(uint32_t)];
@@ -463,12 +594,51 @@ static const char *REG_NAMES[REGS_COUNT] = {
  * Forward definitions
  */
 static void ot_usbdev_server_report_connected(OtUsbdevState *s, bool connected);
+static void ot_usbdev_server_complete_transfer(
+    OtUsbdevState *s, uint32_t id, OtUsbdevServerTransferStatus status,
+    uint32_t xfer_size, const uint8_t *data, uint32_t data_size,
+    const char *msg);
+static void ot_usbdev_complete_transfer_in(OtUsbdevState *s, uint8_t epnum,
+                                           OtUsbdevServerTransferStatus status,
+                                           const char *msg);
+static void ot_usbdev_complete_transfer_out(OtUsbdevState *s, uint8_t epnum,
+                                            OtUsbdevServerTransferStatus status,
+                                            const char *msg);
+static bool ot_usbdev_is_enabled(const OtUsbdevState *s);
 
 /*
- * State handling
+ * Update the INTR_STATE register for status interrupts.
+ */
+static void ot_usbdev_update_status_irqs(OtUsbdevState *s)
+{
+    uint32_t set_mask = 0u;
+    if (ot_usbdev_is_enabled(s)) {
+        if (s->regs[R_IN_SENT]) {
+            set_mask |= USBDEV_INTR_PKT_SENT_MASK;
+        }
+        if (fifo8_is_empty(&s->av_setup_fifo)) {
+            set_mask |= USBDEV_INTR_AV_SETUP_EMPTY_MASK;
+        }
+        if (fifo8_is_empty(&s->av_out_fifo)) {
+            set_mask |= USBDEV_INTR_AV_OUT_EMPTY_MASK;
+        }
+        if (ot_fifo32_is_full(&s->rx_fifo)) {
+            set_mask |= USBDEV_INTR_RX_FULL_MASK;
+        }
+        if (!ot_fifo32_is_empty(&s->rx_fifo)) {
+            set_mask |= USBDEV_INTR_PKT_RECEIVED_MASK;
+        }
+    }
+    s->regs[R_USBDEV_INTR_STATE] |= set_mask;
+}
+
+/*
+ * Update the IRQs at the Ibex given the content of the INTR_*
+ * register.
  */
 static void ot_usbdev_update_irqs(OtUsbdevState *s)
 {
+    ot_usbdev_update_status_irqs(s);
     uint32_t state_masked =
         s->regs[R_USBDEV_INTR_STATE] & s->regs[R_USBDEV_INTR_ENABLE];
 
@@ -481,6 +651,10 @@ static void ot_usbdev_update_irqs(OtUsbdevState *s)
     }
 }
 
+/*
+ * Update the alerts at the Ibex given the content of the ALERT_TEST
+ * register.
+ */
 static void ot_usbdev_update_alerts(OtUsbdevState *s)
 {
     uint32_t level = s->regs[R_ALERT_TEST];
@@ -499,7 +673,7 @@ static void ot_usbdev_update_alerts(OtUsbdevState *s)
  *
  * @return true if enabled (USBCTRL.ENABLE is set).
  */
-static bool ot_usbdev_is_enabled(const OtUsbdevState *s)
+bool ot_usbdev_is_enabled(const OtUsbdevState *s)
 {
     /*
      * Note: this works even if the device is in reset because
@@ -535,6 +709,100 @@ static OtUsbdevLinkState ot_usbdev_get_link_state(const OtUsbdevState *s)
 }
 
 /*
+ * Return the current device address.
+ *
+ * @return value of USBCTRL.DEVICE_ADDRESS
+ */
+static uint8_t ot_usbdev_get_address(const OtUsbdevState *s)
+{
+    return (uint8_t)FIELD_EX32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS);
+}
+
+/*
+ * Determine whether an OUT endpoint is enabled.
+ *
+ * @ep endpoint number
+ * @return value of ep_out_enable.enable_<ep>
+ */
+static bool ot_usbdev_is_ep_out_enabled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_EP_OUT_ENABLE] >> ep) & 1u);
+}
+
+/*
+ * Determine whether an OUT endpoint can receive a packet.
+ *
+ * @ep endpoint number
+ * @return value of rxenable_out.out_<ep>
+ */
+static bool ot_usbdev_is_ep_out_rxenabled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_RXENABLE_OUT] >> ep) & 1u);
+}
+
+/*
+ * Determine whether RX reception is enabled on an endpoint.
+ *
+ * @ep endpoint number
+ * @return value of rxenable_setup.setup_<ep>
+ */
+static bool ot_usbdev_is_ep_setup_rx_enabled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_RXENABLE_SETUP] >> ep) & 1u);
+}
+
+/*
+ * Determine whether an IN endpoint is enabled.
+ *
+ * @ep endpoint number
+ * @return value of ep_in_enable.enable_<ep>
+ */
+static bool ot_usbdev_is_ep_in_enabled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_EP_IN_ENABLE] >> ep) & 1u);
+}
+
+/*
+ * Determine whether an IN endpoint is stalled.
+ *
+ * @ep endpoint number
+ * @return value of in_stall.endpoint_<ep>
+ */
+static bool ot_usbdev_is_ep_in_stalled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_IN_STALL] >> ep) & 1u);
+}
+
+/*
+ * Determine whether an OUT endpoint is stalled.
+ *
+ * @ep endpoint number
+ * @return value of out_stall.endpoint_<ep>
+ */
+static bool ot_usbdev_is_ep_out_stalled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_OUT_STALL] >> ep) & 1u);
+}
+
+/*
+ * Determine whether an OUT endpoint has "auto NAK" enabled.
+ *
+ * @ep endpoint number
+ * @return value of set_nak_out.endpoint_<ep>
+ */
+static bool ot_usbdev_is_set_nak_out_enabled(const OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+    return (bool)((s->regs[R_SET_NAK_OUT] >> ep) & 1u);
+}
+
+/*
  * Change the link state in the USBSTAT register and trace change.
  *
  * Note: no events (IRQs, etc) are triggered, this is the caller's
@@ -551,6 +819,115 @@ ot_usbdev_set_raw_link_state(OtUsbdevState *s, OtUsbdevLinkState state)
 
     s->regs[R_USBSTAT] =
         FIELD_DP32(s->regs[R_USBSTAT], USBSTAT, LINK_STATE, (uint32_t)state);
+}
+
+/*
+ * Write the content of a USB buffer.
+ *
+ * @buf_id ID of the buffer
+ * @buf Buffer holding the data
+ * @size How much data to copy
+ */
+static void ot_usbdev_write_buffer(OtUsbdevState *s, uint8_t buf_id,
+                                   const uint8_t *data, size_t size)
+{
+    g_assert(size <= OT_USBDEV_MAX_PACKET_SIZE);
+    g_assert(buf_id < OT_USBDEV_BUFFER_COUNT);
+
+    /*
+     * See BFM (write_pkt_bytes).
+     *
+     * The buffer is stored as words, which means that if the packet size
+     * is not a multiple of 4, the RTL will zero out the bytes at the end
+     * of the last word.
+     *
+     * This function does not fully emulate the complex behaviour w.r.t
+     * the CRC being written to the buffer or data being remembered in
+     * the flops (see BFM).
+     */
+    uint32_t *ptr =
+        &s->buffer[buf_id * OT_USBDEV_MAX_PACKET_SIZE / sizeof(uint32_t)];
+    while (size >= 4u) {
+        *ptr++ = ldl_le_p(data);
+        data += sizeof(uint32_t);
+        size -= 4u;
+    }
+    if (size == 0u) {
+        return;
+    }
+    /* Handle last incomplete word */
+    uint32_t val32 = 0u;
+    val32 |= *data++;
+    if (size >= 2u) {
+        val32 |= *data++ << 8u;
+    }
+    if (size >= 3u) {
+        val32 |= *data++ << 16u;
+    }
+    *ptr++ = val32;
+}
+
+/*
+ * Read the content of a USB buffer.
+ *
+ * @buf_id ID of the buffer
+ * @buf Buffer where to copy the data
+ * @size How much data to copy
+ */
+static void ot_usbdev_read_buffer(OtUsbdevState *s, uint8_t buf_id,
+                                  uint8_t *buf, size_t size)
+{
+    g_assert(size <= OT_USBDEV_MAX_PACKET_SIZE);
+    g_assert(buf_id < OT_USBDEV_BUFFER_COUNT);
+
+    /*
+     * The buffer is stored as words, we need to emulate that. Could be
+     * optimized.
+     */
+    uint32_t *ptr =
+        &s->buffer[buf_id * OT_USBDEV_MAX_PACKET_SIZE / sizeof(uint32_t)];
+    while (size >= 4u) {
+        stl_le_p(buf, *ptr++);
+        buf += sizeof(uint32_t);
+        size -= 4u;
+    }
+    /* Handle last incomplete word */
+    if (size >= 1u) {
+        uint32_t val32 = *ptr;
+        *buf++ = (uint8_t)val32;
+        val32 >>= 8u;
+        if (size >= 2u) {
+            *buf++ = (uint8_t)val32;
+            val32 >>= 8u;
+        }
+        if (size >= 3u) {
+            *buf++ = (uint8_t)val32;
+        }
+    }
+}
+
+/*
+ * Update the content of the USBSTAT buffer to reflect the FIFO state
+ * and update the corresponding IRQs.
+ */
+static void ot_usbdev_update_fifos_status(OtUsbdevState *s)
+{
+    uint32_t val = s->regs[R_USBSTAT];
+    val = FIELD_DP32(val, USBSTAT, RX_EMPTY,
+                     (uint32_t)ot_fifo32_is_empty(&s->rx_fifo));
+    val = FIELD_DP32(val, USBSTAT, AV_SETUP_FULL,
+                     (uint32_t)fifo8_is_full(&s->av_setup_fifo));
+    val = FIELD_DP32(val, USBSTAT, RX_DEPTH,
+                     (uint32_t)ot_fifo32_num_used(&s->rx_fifo));
+    val = FIELD_DP32(val, USBSTAT, AV_OUT_FULL,
+                     (uint32_t)fifo8_is_full(&s->av_out_fifo));
+    val = FIELD_DP32(val, USBSTAT, AV_SETUP_DEPTH,
+                     (uint32_t)fifo8_num_used(&s->av_setup_fifo));
+    val = FIELD_DP32(val, USBSTAT, AV_OUT_DEPTH,
+                     (uint32_t)fifo8_num_used(&s->av_out_fifo));
+    s->regs[R_USBSTAT] = val;
+
+    ot_usbdev_update_irqs(s);
 }
 
 /*
@@ -633,21 +1010,41 @@ static void ot_usbdev_set_vbus_gate(OtUsbdevState *s, bool gate)
 }
 
 /*
+ * Retire any IN packet on the given endpoint.
+ *
+ * Mark any ready packet as pending but not ready and not sending.
+ */
+static void ot_usbdev_retire_in_packets(OtUsbdevState *s, uint8_t ep)
+{
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+
+    uint32_t configin = s->regs[R_CONFIGIN_0 + ep];
+    if ((bool)SHARED_FIELD_EX32(configin, CONFIGIN_RDY)) {
+        configin = SHARED_FIELD_DP32(configin, CONFIGIN_RDY, 0u);
+        configin = SHARED_FIELD_DP32(configin, CONFIGIN_PEND, 1u);
+
+        trace_ot_usbdev_retire_in_packet(s->ot_id, ep);
+    }
+    configin = SHARED_FIELD_DP32(configin, CONFIGIN_SENDING, 0u);
+    s->regs[R_CONFIGIN_0 + ep] = configin;
+}
+
+/*
  * Simulate a link reset.
  *
  * This function will trigger all necessary state and IRQs changes necessary to
  * perform a link reset.
- *
- * @todo document what happens to transfers when done
  */
 static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
 {
     g_assert(!resettable_is_in_reset(OBJECT(s)));
 
+    trace_ot_usbdev_link_reset(s->ot_id);
+
     /* We cannot simulate a reset if the device is disconnected! */
     if (ot_usbdev_get_link_state(s) == OT_USBDEV_LINK_STATE_DISCONNECTED) {
-        error_report("%s: %s Link reset while disconnected?!", __func__,
-                     s->ot_id);
+        trace_ot_usbdev_server_protocol_error(s->ot_id,
+                                              "link reset while disconnected");
         return;
     }
 
@@ -655,13 +1052,393 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
     s->regs[R_USBCTRL] =
         FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
     s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_RESET_MASK;
-    /* @todo cancel all transfers */
+
+    for (unsigned ep = 0; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
+        /* Cancel any pending IN packets */
+        ot_usbdev_retire_in_packets(s, ep);
+        /* Cancel all pending transfers on the server */
+        ot_usbdev_complete_transfer_in(s, ep, OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                       "cancelled by link reset");
+        ot_usbdev_complete_transfer_out(s, ep,
+                                        OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                        "cancelled by link reset");
+    }
 
     if (ot_usbdev_has_vbus(s) && ot_usbdev_is_enabled(s)) {
-        /* @todo BFM has some extra state processing but it seems incorrect */
-        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE_NOSOF);
+        /*
+         * @todo BFM has some extra state processing but it seems incorrect
+         * @todo If we start tracking frames, this should transition the link
+         * state to ACTIVE_NOSOF and then simulate a transition to ACTIVE on
+         * the next SOF.
+         */
+        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE);
     }
     ot_usbdev_update_irqs(s);
+}
+
+/*
+ * Simulate the reception of a SETUP token followed by an 8-byte
+ * DATA packet containing the SETUP packet.
+ *
+ * Note: when called, the trace_ot_usbdev_setup event has not been called yet.
+ */
+static void ot_usbdev_simulate_setup(OtUsbdevState *s, uint8_t ep,
+                                     uint8_t setup[OT_USBDEV_SETUP_PACKET_SIZE])
+{
+    g_assert(!resettable_is_in_reset(OBJECT(s)));
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+
+    /* We cannot simulate a reset if the device is disconnected! */
+    if (ot_usbdev_get_link_state(s) == OT_USBDEV_LINK_STATE_DISCONNECTED) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "SETUP packet while disconnected");
+        trace_ot_usbdev_setup(s->ot_id, ep,
+                              "ignored (device is not connected)");
+        return;
+    }
+
+    /* See BFM (token_packet) */
+
+    /* A SETUP packet resets the data toggles of enabled endpoints */
+    if (ot_usbdev_is_ep_out_enabled(s, ep)) {
+        s->regs[R_OUT_DATA_TOGGLE] &=
+            ~FIELD_DP32(0u, OUT_DATA_TOGGLE, STATUS, 1u << ep);
+    }
+    if (ot_usbdev_is_ep_in_enabled(s, ep)) {
+        s->regs[R_IN_DATA_TOGGLE] |=
+            FIELD_DP32(0u, IN_DATA_TOGGLE, STATUS, 1u << ep);
+    }
+
+    /* Drop SETUP if EP is not enabled or RX is not enabled for SETUP. */
+    if (!ot_usbdev_is_ep_out_enabled(s, ep)) {
+        /* Packet is silently ignored without triggering an error. */
+        trace_ot_usbdev_setup(s->ot_id, ep,
+                              "dropped (device has not enabled OUT endpoint)");
+        return;
+    }
+
+    /* See BFM (data_packet and out_packet) */
+    if (!ot_usbdev_is_ep_setup_rx_enabled(s, ep)) {
+        /* Packet is silently ignored without triggering an error. */
+        trace_ot_usbdev_setup(
+            s->ot_id, ep, "dropped (device has not enabled SETUP reception)");
+        return;
+    }
+    if (fifo8_is_empty(&s->av_setup_fifo) || ot_fifo32_is_full(&s->rx_fifo)) {
+        trace_ot_usbdev_setup(s->ot_id, ep,
+                              "dropped (AV SETUP FIFO empty or RX FIFO full)");
+        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_OUT_ERR_MASK;
+        ot_usbdev_update_irqs(s);
+        return;
+    }
+
+    trace_ot_usbdev_setup(s->ot_id, ep, "accepted");
+
+    /*
+     * Obtain the next SETUP buffer ID and write the SETUP packet to the buffer
+     */
+    uint8_t buf_id = fifo8_pop(&s->av_setup_fifo);
+    ot_usbdev_write_buffer(s, buf_id, setup, OT_USBDEV_SETUP_PACKET_SIZE);
+
+    /* Create and push an entry in the RX FIFO */
+    uint32_t rx_fifo_entry = 0u;
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, BUFFER, buf_id);
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, SETUP, 1u);
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, EP, ep);
+    rx_fifo_entry =
+        FIELD_DP32(rx_fifo_entry, RXFIFO, SIZE, OT_USBDEV_SETUP_PACKET_SIZE);
+    ot_fifo32_push(&s->rx_fifo, rx_fifo_entry);
+
+    /* clear any STALL condition */
+    s->regs[R_OUT_STALL] &= ~(1u << ep);
+    s->regs[R_IN_STALL] &= ~(1u << ep);
+
+    /* Cancel any pending IN packet on this endpoint */
+    ot_usbdev_retire_in_packets(s, ep);
+
+    /* Cancel any transfer on the server side on this endpoint */
+    ot_usbdev_complete_transfer_in(s, ep, OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                   "cancelled by setup packet");
+    ot_usbdev_complete_transfer_out(s, ep, OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                    "cancelled by setup packet");
+
+    ot_usbdev_update_fifos_status(s);
+    ot_usbdev_update_irqs(s);
+}
+
+/*
+ * Complete an IN transfer and notify the host.
+ *
+ * If there is no transfer pending on this endpoint, this function does nothing.
+ *
+ * @epnum Endpoint number
+ * @status Status of the transfer (sent to the host)
+ * @msg Details on the transfer status (using for tracing only)
+ */
+void ot_usbdev_complete_transfer_in(OtUsbdevState *s, uint8_t epnum,
+                                    OtUsbdevServerTransferStatus status,
+                                    const char *msg)
+{
+    g_assert(epnum < USBDEV_PARAM_N_ENDPOINTS);
+    OtUsbdevServer *server = &s->usb_server;
+    OtUsbdevServerEpInXfer *xfer = &server->ep[epnum].in;
+
+    /* Nothing to do if no transfer is pending */
+    if (!xfer->pending) {
+        return;
+    }
+
+    uint32_t xfered_len = xfer->xfer_len - xfer->recv_rem;
+    ot_usbdev_server_complete_transfer(s, xfer->id, status, xfered_len,
+                                       xfer->xfer_buf, xfered_len, msg);
+
+    /* cleanup */
+    g_free(xfer->xfer_buf);
+    memset(xfer, 0, sizeof(OtUsbdevServerEpInXfer));
+}
+
+/*
+ * Complete an OUT transfer and notify the host.
+ *
+ * If there is no transfer pending on this endpoint, this function does nothing.
+ *
+ * @epnum Endpoint number
+ * @status Status of the transfer (sent to the host)
+ * @msg Details on the transfer status (using for tracing only)
+ */
+void ot_usbdev_complete_transfer_out(OtUsbdevState *s, uint8_t epnum,
+                                     OtUsbdevServerTransferStatus status,
+                                     const char *msg)
+{
+    g_assert(epnum < USBDEV_PARAM_N_ENDPOINTS);
+    OtUsbdevServer *server = &s->usb_server;
+    OtUsbdevServerEpOutXfer *xfer = &server->ep[epnum].out;
+
+    /* Nothing to do if no transfer is pending */
+    if (!xfer->pending) {
+        return;
+    }
+
+    uint32_t xfered_len = xfer->xfer_len - xfer->send_rem;
+    ot_usbdev_server_complete_transfer(s, xfer->id, status, xfered_len, NULL,
+                                       0u, msg);
+
+    /* cleanup */
+    g_free(xfer->xfer_buf);
+    memset(xfer, 0, sizeof(OtUsbdevServerEpOutXfer));
+}
+
+/*
+ * Try to make progress with an IN transfer on this endpoint.
+ *
+ * This function will check if the necessary conditions are present
+ * to send a new packet to the host and trigger the necessary events.
+ * If a STALL condition is detected, the transfer will automatically
+ * be cancelled and the host will be notified.
+ * If a NAK condition is detected (e.g. host has a pending transfer
+ * but the device has not yet given a packet for transmission), this
+ * function will do nothing.
+ */
+static void ot_usbdev_advance_transfer_in(OtUsbdevState *s, uint8_t epnum)
+{
+    g_assert(epnum < USBDEV_PARAM_N_ENDPOINTS);
+    /* See BFM (in_packet and handshake_packet) */
+
+    /* Nothing to do if there is no pending transfer */
+    OtUsbdevServer *server = &s->usb_server;
+    OtUsbdevServerEpInXfer *xfer = &server->ep[epnum].in;
+    if (!xfer->pending) {
+        return;
+    }
+
+    /*
+     * If the endpoint is not enabled, the device will silently ignore the
+     * packet, causing an error.
+     */
+    if (!ot_usbdev_is_ep_in_enabled(s, epnum)) {
+        ot_usbdev_complete_transfer_in(s, epnum, OT_USBDEV_SERVER_STATUS_ERROR,
+                                       "endpoint IN not enabled");
+        return;
+    }
+
+    /* Check for STALL */
+    if (ot_usbdev_is_ep_in_stalled(s, epnum)) {
+        ot_usbdev_complete_transfer_in(s, epnum,
+                                       OT_USBDEV_SERVER_STATUS_STALLED,
+                                       "stalled by device");
+        return;
+    }
+
+    hwaddr reg = R_CONFIGIN_0 + epnum;
+    uint32_t configin = s->regs[reg];
+    bool ready = (bool)SHARED_FIELD_EX32(configin, CONFIGIN_RDY);
+    uint32_t pkt_size = SHARED_FIELD_EX32(configin, CONFIGIN_SIZE);
+    uint8_t buf_id = (uint8_t)SHARED_FIELD_EX32(configin, CONFIGIN_BUFFER);
+
+    /* Nothing to do if no packet is ready */
+    if (!ready) {
+        return;
+    }
+
+    /*
+     * Make sure buffer ID is valid. With the current constants, this check is
+     * always true but potentially could before false if the IP became more
+     * parametrized.
+     */
+    if (buf_id >= OT_USBDEV_BUFFER_COUNT) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: %s: write to CONFIGIN%d with invalid BUFFER (%u)\n",
+                      __func__, s->ot_id, epnum, buf_id);
+        return;
+    }
+
+    trace_ot_usbdev_packet_sent(s->ot_id, epnum, buf_id, pkt_size);
+
+    /* Mark the packet as sent and acknowledged by the host */
+    configin = SHARED_FIELD_DP32(configin, CONFIGIN_RDY, 0u);
+    s->regs[reg] = configin;
+    s->regs[R_IN_DATA_TOGGLE] ^=
+        FIELD_DP32(0u, IN_DATA_TOGGLE, STATUS, 1u << epnum);
+    s->regs[R_IN_SENT] |= 1u << epnum;
+    ot_usbdev_update_irqs(s);
+
+    /* Check for overflow */
+    if (pkt_size > xfer->max_packet_size) {
+        ot_usbdev_complete_transfer_in(
+            s, epnum, OT_USBDEV_SERVER_STATUS_ERROR,
+            "device sent packet bigger than max packet size");
+        return;
+    }
+    if (pkt_size > xfer->recv_rem) {
+        ot_usbdev_complete_transfer_in(s, epnum, OT_USBDEV_SERVER_STATUS_ERROR,
+                                       "device sent more data than expected");
+        return;
+    }
+
+    /* Copy data and advance buffers */
+    ot_usbdev_read_buffer(s, buf_id, xfer->recv_buf, pkt_size);
+
+    xfer->recv_buf += pkt_size;
+    xfer->recv_rem -= pkt_size;
+
+    /* Handle completion */
+    if (pkt_size < xfer->max_packet_size || xfer->recv_rem == 0u) {
+        ot_usbdev_complete_transfer_in(s, epnum,
+                                       OT_USBDEV_SERVER_STATUS_SUCCESS,
+                                       "success");
+        return;
+    }
+}
+
+/*
+ * Try to make progress with an OUT transfer on this endpoint.
+ *
+ * This function will check if the necessary conditions are present
+ * to receive a new packet from the host and trigger the necessary events.
+ * If a STALL condition is detected, the transfer will automatically
+ * be cancelled and the host will be notified.
+ * If a NAK condition is detected (e.g. the host has no transfer pending,
+ * or the device has not enabled reception), this
+ * function will do nothing.
+ */
+static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
+{
+    g_assert(epnum < USBDEV_PARAM_N_ENDPOINTS);
+    /* See BFM (out_packet) */
+
+    /* Nothing to do if there is no pending transfer */
+    OtUsbdevServer *server = &s->usb_server;
+    OtUsbdevServerEpOutXfer *xfer = &server->ep[epnum].out;
+    if (!xfer->pending) {
+        return;
+    }
+
+    /*
+     * If the endpoint OUT is not enabled, the device will silently ignore the
+     * packet, causing an error.
+     */
+    if (!ot_usbdev_is_ep_out_enabled(s, epnum)) {
+        ot_usbdev_complete_transfer_out(s, epnum, OT_USBDEV_SERVER_STATUS_ERROR,
+                                        "endpoint OUT not enabled");
+        return;
+    }
+
+    /* Check for STALL */
+    if (ot_usbdev_is_ep_out_stalled(s, epnum)) {
+        ot_usbdev_complete_transfer_out(s, epnum,
+                                        OT_USBDEV_SERVER_STATUS_STALLED,
+                                        "stalled by device");
+        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_OUT_ERR_MASK;
+        ot_usbdev_update_irqs(s);
+        return;
+    }
+
+    /*
+     * Only accept the DATA packet if the endpoint is enabled, and there is
+     * buffer available and there is space in the RX FIFO. The last entry of the
+     * FIFO is reserved for SETUP packets.
+     */
+    if (!ot_usbdev_is_ep_out_rxenabled(s, epnum) ||
+        fifo8_is_empty(&s->av_out_fifo) ||
+        ot_fifo32_num_free(&s->rx_fifo) <= 1u) {
+        /* Notify the software about the error */
+        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_OUT_ERR_MASK;
+        ot_usbdev_update_irqs(s);
+        /* "NAK" packet, OUT transfer will be retried */
+        return;
+    }
+
+    /* Write data to buffer and update transfer status */
+    uint8_t buf_id = fifo8_pop(&s->av_out_fifo);
+    uint32_t size = MIN((uint32_t)xfer->max_packet_size, xfer->send_rem);
+    ot_usbdev_write_buffer(s, buf_id, xfer->send_buf, (size_t)size);
+    xfer->send_buf += size;
+    xfer->send_rem -= size;
+
+    /* Create and push an entry in the RX FIFO */
+    uint32_t rx_fifo_entry = 0u;
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, BUFFER, buf_id);
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, SETUP, 0u);
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, EP, epnum);
+    rx_fifo_entry = FIELD_DP32(rx_fifo_entry, RXFIFO, SIZE, size);
+    ot_fifo32_push(&s->rx_fifo, rx_fifo_entry);
+
+    s->regs[R_OUT_DATA_TOGGLE] ^=
+        FIELD_DP32(0u, IN_DATA_TOGGLE, STATUS, 1u << epnum);
+
+    trace_ot_usbdev_packet_received(s->ot_id, epnum, buf_id, size);
+
+    /* Disable RX if auto-NAK on OUT is set. */
+    if (ot_usbdev_is_set_nak_out_enabled(s, epnum)) {
+        s->regs[R_RXENABLE_OUT] &= ~(1u << epnum);
+    }
+
+    ot_usbdev_update_fifos_status(s);
+    ot_usbdev_update_irqs(s);
+
+    /* Handle completion */
+    if (xfer->send_rem == 0 && !xfer->send_zlp) {
+        ot_usbdev_complete_transfer_out(s, epnum,
+                                        OT_USBDEV_SERVER_STATUS_SUCCESS,
+                                        "success");
+        return;
+    }
+    if (xfer->send_rem == 0 && xfer->send_zlp) {
+        /*
+         * If we have sent everything and a ZLP is requested, go for a last
+         * round
+         */
+        xfer->send_zlp = false;
+    }
+
+    /*
+     * @todo If the transfer is not complete and RX is still active, we need to
+     * trigger one or more packet reception. However we do not want to do that
+     * in a loop here because it could lead to starvation on other endpoints.
+     * Need to have a timer to do some scheduling.
+     */
+    qemu_log_mask(LOG_UNIMP, "%s: %s: unfinished transfer on EP%u OUT\n",
+                  __func__, s->ot_id, epnum);
 }
 
 /*
@@ -697,7 +1474,6 @@ static void ot_usbdev_write_usbctrl(OtUsbdevState *s, uint32_t val32)
             ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_POWERED);
             ot_usbdev_server_report_connected(s, true);
         }
-        /* @todo Handle FIFO interrupts */
     } else {
         /* See BFM (set_enable) */
         ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_DISCONNECTED);
@@ -708,10 +1484,117 @@ static void ot_usbdev_write_usbctrl(OtUsbdevState *s, uint32_t val32)
         if (ot_usbdev_has_vbus(s)) {
             ot_usbdev_server_report_connected(s, false);
         }
-        /* @todo Handle FIFO interrupts */
     }
 
+    /*
+     * Status interrupts are only active when enabled, we may need to update
+     * them
+     */
+    ot_usbdev_update_status_irqs(s);
     ot_usbdev_update_irqs(s);
+}
+
+/*
+ * Update the value of a CONFIGINx register.
+ *
+ * This function will update the CONFIGINx register after a write and
+ * trigger the necessary changes. If as a result of this change a transfer
+ * completes, the server will be notified.
+ *
+ * @reg Register index
+ * @val32 New value
+ */
+static void ot_usbdev_write_configin(OtUsbdevState *s, hwaddr reg,
+                                     uint32_t val32)
+{
+    uint8_t ep = (uint8_t)(reg - R_CONFIGIN_0);
+    g_assert(ep < USBDEV_PARAM_N_ENDPOINTS);
+
+    /*
+     * @todo clarify what writing 1 to SENDING is supposed to do since this
+     * is a hardware signal and not a status bit, doc is unclear.
+     * In this emulated driver, the SENDING bit is never set by the code.
+     */
+
+    /* clear RW1C fields */
+    uint32_t rw1c = val32 & USBDEV_CONFIGIN_RW1C_MASK;
+    s->regs[reg] &= ~rw1c;
+    /* set RW fields */
+    s->regs[reg] &= USBDEV_CONFIGIN_RW1C_MASK;
+    s->regs[reg] |= val32 & ~USBDEV_CONFIGIN_RW1C_MASK;
+
+    ot_usbdev_advance_transfer_in(s, ep);
+}
+
+/*
+ * Update the transfers pending on one or more endpoints whose status
+ * has changed.
+ *
+ * After changing the status of an endpoint (e.g. (un)stall, nak,
+ * RX/TX enable), this function must be called to re-evaluate whether
+ * the pending transfers can make progress. Only endpoints set in the
+ * mask will be considered.
+ *
+ * @dir_in True for IN transfers, false for OUT.
+ * @ep_mask The n-th bit represents the n-th endpoint.
+ *
+ */
+static void ot_usbdev_update_ep_xfers(OtUsbdevState *s, bool dir_in,
+                                      uint32_t ep_mask)
+{
+    /* For each disabled ep, update the transfer to trigger an error */
+    for (uint8_t ep = 0u; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
+        if (((ep_mask >> ep) & 1u) == 0u) {
+            continue;
+        }
+        if (dir_in) {
+            ot_usbdev_advance_transfer_in(s, ep);
+        } else {
+            ot_usbdev_advance_transfer_out(s, ep);
+        }
+    }
+}
+
+/*
+ * Handle write to register which changes whether an endpoint is
+ * enabled or not. Trigger the necessary changes to transfers if any.
+ *
+ * This function will update the content of the register with the given value.
+ *
+ * @reg One of R_EP_IN_ENABLE, R_EP_OUT_ENABLE, R_RXENABLE_SETUP or
+ * R_RXENABLE_OUT
+ * @val32 New value of the register.
+ */
+static void
+ot_usbdev_update_ep_enabled(OtUsbdevState *s, hwaddr reg, uint32_t val32)
+{
+    /* Find which endpoints have been disabled */
+    uint32_t disabled_ep = s->regs[reg] & ~val32;
+    s->regs[reg] = val32 & ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u);
+
+    bool dir_in = reg == R_EP_IN_ENABLE;
+    ot_usbdev_update_ep_xfers(s, dir_in, disabled_ep);
+}
+
+/*
+ * Handle write to register which changes whether an endpoint is
+ * stalled or not. Trigger the necessary changes to transfers if any.
+ *
+ * This function will update the content of the register with the given value.
+ *
+ * @reg One of  R_OUT_STALL or R_IN_STALL:
+ * @val32 New value of the register.
+ */
+static void
+ot_usbdev_update_ep_stalled(OtUsbdevState *s, hwaddr reg, uint32_t val32)
+{
+    /* Find which endpoints have been stalled */
+    uint32_t stalled_ep =
+        (~s->regs[reg] & val32) & ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u);
+    s->regs[reg] = val32 & ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u);
+
+    bool dir_in = reg == R_IN_STALL;
+    ot_usbdev_update_ep_xfers(s, dir_in, stalled_ep);
 }
 
 /*
@@ -736,7 +1619,6 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
     case R_EP_IN_ENABLE:
     case R_AVOUTBUFFER:
     case R_AVSETUPBUFFER:
-    case R_RXFIFO:
     case R_RXENABLE_SETUP:
     case R_RXENABLE_OUT:
     case R_SET_NAK_OUT:
@@ -769,6 +1651,19 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
     case R_COUNT_NODATA_IN:
     case R_COUNT_ERRORS:
         val32 = s->regs[reg];
+        break;
+    case R_RXFIFO:
+        if (ot_fifo32_is_empty(&s->rx_fifo)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: %s: read to RXFIFO but FIFO is empty\n",
+                          __func__, s->ot_id);
+            val32 = 0u;
+        } else {
+            val32 = ot_fifo32_pop(&s->rx_fifo);
+            trace_ot_usbdev_pop_rx_fifo(s->ot_id, val32);
+            ot_usbdev_update_fifos_status(s);
+            /* @todo trigger out transfers potentially */
+        }
         break;
     case R_USBDEV_INTR_TEST:
     case R_ALERT_TEST:
@@ -806,13 +1701,6 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
 
     switch (reg) {
     case R_USBDEV_INTR_STATE:
-        if (val32 & ~USBDEV_INTR_RW1C_MASK) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: %s: write to R/O register 0x%02" HWADDR_PRIx
-                          " (%s) field 0x%08x\n",
-                          __func__, s->ot_id, addr, REG_NAME(reg),
-                          val32 & ~USBDEV_INTR_RW1C_MASK);
-        }
         val32 &= USBDEV_INTR_RW1C_MASK;
         s->regs[reg] &= ~val32;
         ot_usbdev_update_irqs(s);
@@ -833,13 +1721,13 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
         s->regs[R_ALERT_TEST] = val32;
         ot_usbdev_update_alerts(s);
         break;
+    case R_RXFIFO:
     case R_USBSTAT:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: %s: write to R/O register 0x%02" HWADDR_PRIx
                       " (%s)\n",
                       __func__, s->ot_id, addr, REG_NAME(reg));
         break;
-    /* Writes without side-effects */
     case R_PHY_CONFIG:
         /* @todo mask against actual fields? */
         s->regs[R_PHY_CONFIG] = val32;
@@ -847,17 +1735,41 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
     case R_USBCTRL:
         ot_usbdev_write_usbctrl(s, val32);
         break;
-    case R_EP_OUT_ENABLE:
     case R_EP_IN_ENABLE:
-    case R_AVOUTBUFFER:
-    case R_AVSETUPBUFFER:
-    case R_RXFIFO:
+    case R_EP_OUT_ENABLE:
     case R_RXENABLE_SETUP:
     case R_RXENABLE_OUT:
-    case R_SET_NAK_OUT:
-    case R_IN_SENT:
+        ot_usbdev_update_ep_enabled(s, reg, val32);
+        break;
     case R_OUT_STALL:
     case R_IN_STALL:
+        ot_usbdev_update_ep_stalled(s, reg, val32);
+        break;
+    case R_AVOUTBUFFER:
+        if (fifo8_is_full(&s->av_out_fifo)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: %s: write to AVOUTBUFFER but FIFO is full\n",
+                          __func__, s->ot_id);
+        } else {
+            uint8_t buf_id = (uint8_t)FIELD_EX32(val32, AVOUTBUFFER, BUFFER);
+            fifo8_push(&s->av_out_fifo, buf_id);
+            trace_ot_usbdev_push_av_out_buffer(s->ot_id, buf_id);
+            ot_usbdev_update_fifos_status(s);
+            /* @todo trigger out transfers potentially */
+        }
+        break;
+    case R_AVSETUPBUFFER:
+        if (fifo8_is_full(&s->av_setup_fifo)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: %s: write to AVSETUPBUFFER but FIFO is full\n",
+                          __func__, s->ot_id);
+        } else {
+            uint8_t buf_id = (uint8_t)FIELD_EX32(val32, AVSETUPBUFFER, BUFFER);
+            fifo8_push(&s->av_setup_fifo, buf_id);
+            trace_ot_usbdev_push_av_setup_buffer(s->ot_id, buf_id);
+            ot_usbdev_update_fifos_status(s);
+        }
+        break;
     case R_CONFIGIN_0:
     case R_CONFIGIN_1:
     case R_CONFIGIN_2:
@@ -870,6 +1782,15 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
     case R_CONFIGIN_9:
     case R_CONFIGIN_10:
     case R_CONFIGIN_11:
+        ot_usbdev_write_configin(s, reg, val32);
+        break;
+    case R_IN_SENT:
+        /* register is rw1c */
+        s->regs[reg] &= ~val32;
+        break;
+    case R_SET_NAK_OUT:
+        s->regs[reg] = val32;
+        break;
     case R_OUT_ISO:
     case R_IN_ISO:
     case R_OUT_DATA_TOGGLE:
@@ -972,11 +1893,24 @@ static void ot_usbdev_server_close(OtUsbdevState *s)
 /*
  * Send a message to the client.
  *
- * @todo clarify blocking/non-blocking
+ * To avoid an allocation, this function supports sending the payload
+ * data in two segments, represented by two buffers (data0 and data1).
+ * Any buffer with size zero will be ignored.
+ *
+ * @todo This function must be non-blocking, clarify if that's really
+ * the case.
+ *
+ * @s Device state
+ * @cmd Command
+ * @id Packet ID
+ * @data0 First part of the payload data (can be NULL if size0 is set)
+ * @data0 Size of the first part of the payload data
+ * @data1 Second part of the payload data (can be NULL if size1 is set)
+ * @data1 Size of the second part of the payload data
  */
-static void ot_usbdev_server_write_packet(OtUsbdevState *s,
-                                          OtUsbdevServerCmd cmd, uint32_t id,
-                                          const void *data, size_t size)
+static void ot_usbdev_server_write_packet(
+    OtUsbdevState *s, OtUsbdevServerCmd cmd, uint32_t id, const uint8_t *data0,
+    size_t size0, const uint8_t *data1, size_t size1)
 {
     /*
      * @todo Update this to handle partial writes, by adding them to a queue and
@@ -984,7 +1918,7 @@ static void ot_usbdev_server_write_packet(OtUsbdevState *s,
      */
     const OtUsbdevServerPktHdr hdr = {
         .cmd = cmd,
-        .size = size,
+        .size = size0 + size1,
         .id = id,
     };
     int res =
@@ -994,9 +1928,17 @@ static void ot_usbdev_server_write_packet(OtUsbdevState *s,
                       __func__, s->ot_id);
         return;
     }
-    if (size > 0u) {
-        res = qemu_chr_fe_write(&s->usb_chr, (const uint8_t *)data, (int)size);
-        if (res < size) {
+    if (size0 > 0u) {
+        res = qemu_chr_fe_write(&s->usb_chr, data0, (int)size0);
+        if (res < size0) {
+            qemu_log_mask(LOG_UNIMP, "%s: %s server: unhandled partial write\n",
+                          __func__, s->ot_id);
+            return;
+        }
+    }
+    if (size1 > 0u) {
+        res = qemu_chr_fe_write(&s->usb_chr, data1, (int)size1);
+        if (res < size1) {
             qemu_log_mask(LOG_UNIMP, "%s: %s server: unhandled partial write\n",
                           __func__, s->ot_id);
             return;
@@ -1026,7 +1968,7 @@ void ot_usbdev_server_report_connected(OtUsbdevState *s, bool connected)
     ot_usbdev_server_write_packet(s,
                                   connected ? OT_USBDEV_SERVER_CMD_CONNECT :
                                               OT_USBDEV_SERVER_CMD_DISCONNECT,
-                                  0u, NULL, 0u);
+                                  0u, NULL, 0u, NULL, 0u);
 }
 
 /*
@@ -1041,13 +1983,13 @@ static void ot_usbdev_server_process_hello(OtUsbdevState *s)
     OtUsbdevServer *server = &s->usb_server;
 
     if (server->hello_done) {
-        error_report("%s: %s server: unexpected HELLO\n", __func__, s->ot_id);
+        trace_ot_usbdev_server_protocol_error(s->ot_id, "unexpected HELLO");
         /* Not a fatal error */
     }
     if (server->recv_pkt.size != sizeof(OtUsbdevServerHelloPkt)) {
-        error_report("%s: %s server: HELLO packet with unexpected payload "
-                     "size %u, ignoring packet\n",
-                     __func__, s->ot_id, server->recv_pkt.size);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id,
+            "HELLO packet with unexpected payload size, ignoring packet");
         return;
     }
     /*
@@ -1058,17 +2000,15 @@ static void ot_usbdev_server_process_hello(OtUsbdevState *s)
     memcpy(&hello, server->recv_data, sizeof(OtUsbdevServerHelloPkt));
     if (memcmp(hello.magic, OT_USBDEV_SERVER_HELLO_MAGIC,
                sizeof(hello.magic)) != 0) {
-        error_report("%s: %s server: HELLO packet with unexpected magic value "
-                     "%.4s, ignoring packet\n",
-                     __func__, s->ot_id, hello.magic);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id,
+            "HELLO packet with unexpected magic value, ignoring packet");
         return;
     }
     if (hello.major_version != OT_USBDEV_SERVER_MAJOR_VER ||
         hello.minor_version != OT_USBDEV_SERVER_MINOR_VER) {
-        error_report("%s: %s server: HELLO packet with unexpected version "
-                     "version %d.%d, ignoring packet\n",
-                     __func__, s->ot_id, hello.major_version,
-                     hello.minor_version);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "HELLO packet with unexpected version, ignoring packet");
         return;
     }
     server->hello_done = true;
@@ -1084,8 +2024,8 @@ static void ot_usbdev_server_process_hello(OtUsbdevState *s)
     resp_hello.minor_version = OT_USBDEV_SERVER_MINOR_VER;
     ot_usbdev_server_write_packet(s, OT_USBDEV_SERVER_CMD_HELLO,
                                   server->recv_pkt.id,
-                                  (const void *)&resp_hello,
-                                  sizeof(resp_hello));
+                                  (const void *)&resp_hello, sizeof(resp_hello),
+                                  NULL, 0u);
 }
 
 static void ot_usbdev_server_process_reset(OtUsbdevState *s)
@@ -1093,16 +2033,14 @@ static void ot_usbdev_server_process_reset(OtUsbdevState *s)
     OtUsbdevServer *server = &s->usb_server;
 
     if (server->recv_pkt.size != 0u) {
-        error_report("%s: %s server: RESET packet with unexpected payload, "
-                     "ignoring packet\n",
-                     __func__, s->ot_id);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "RESET packet with unexpected payload, ignoring packet");
         return;
     }
     /* Ignore if device is not enabled */
     if (resettable_is_in_reset(OBJECT(s))) {
-        error_report(
-            "%s: %s server: RESET when device is in reset, ignoring packet\n",
-            __func__, s->ot_id);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "RESET when device is in reset, ignoring packet");
         return;
     }
 
@@ -1114,14 +2052,210 @@ static void ot_usbdev_server_process_vbus_changed(OtUsbdevState *s, bool vbus)
     OtUsbdevServer *server = &s->usb_server;
 
     if (server->recv_pkt.size != 0u) {
-        error_report("%s: %s server: VBUS_ON/OFF packet with unexpected "
-                     "payload, ignoring packet\n",
-                     __func__, s->ot_id);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id,
+            "VBUS_ON/OFF packet with unexpected payload, ignoring packet");
         return;
     }
 
     server->vbus_connected = vbus;
     ot_usbdev_update_vbus(s);
+}
+
+static void ot_usbdev_server_process_setup(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->recv_pkt.size != sizeof(OtUsbdevServerSetupPkt)) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id,
+            "SETUP packet with unexpected payload size, ignoring packet");
+        return;
+    }
+    /* Ignore if device is not enabled */
+    if (resettable_is_in_reset(OBJECT(s))) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "SETUP when device is in reset, ignoring packet");
+        return;
+    }
+
+    OtUsbdevServerSetupPkt setup;
+    memcpy(&setup, server->recv_data, sizeof(OtUsbdevServerSetupPkt));
+
+    /* @todo enforce that reserved is 0 */
+
+    /* Ignore SETUP if address or endpoint is not ours */
+    if (setup.address != ot_usbdev_get_address(s) ||
+        setup.endpoint >= USBDEV_PARAM_N_ENDPOINTS) {
+        trace_ot_usbdev_setup_addr(
+            s->ot_id, setup.address, setup.endpoint,
+            "ignore (mismatching address or invalid endpoint)");
+        return;
+    }
+
+    ot_usbdev_simulate_setup(s, setup.endpoint, setup.setup);
+}
+
+void ot_usbdev_server_complete_transfer(OtUsbdevState *s, uint32_t id,
+                                        OtUsbdevServerTransferStatus status,
+                                        uint32_t xfer_size, const uint8_t *data,
+                                        uint32_t data_size, const char *msg)
+{
+    trace_ot_usbdev_complete_transfer(s->ot_id, id, xfer_size,
+                                      XFER_STATUS_NAME(status), msg);
+
+    OtUsbdevServerCompletePkt pkt;
+    memset(&pkt, 0u, sizeof(pkt));
+    pkt.status = (uint8_t)status;
+    pkt.transfer_size = xfer_size;
+    ot_usbdev_server_write_packet(s, OT_USBDEV_SERVER_CMD_COMPLETE, id,
+                                  (const uint8_t *)&pkt, sizeof(pkt), data,
+                                  data_size);
+}
+
+static void ot_usbdev_server_process_transfer_in(
+    OtUsbdevState *s, uint8_t ep, uint8_t flags, uint16_t max_packet_size,
+    uint32_t transfer_size)
+{
+    OtUsbdevServer *server = &s->usb_server;
+    OtUsbdevServerEpInXfer *xfer = &server->ep[ep].in;
+
+    /* It is an error to send a transfer if one is pending */
+    if (xfer->pending) {
+        trace_ot_usbdev_transfer(s->ot_id, server->recv_pkt.id, ep, "IN", flags,
+                                 max_packet_size, transfer_size,
+                                 "error (transfer already pending)");
+        ot_usbdev_server_complete_transfer(s, server->recv_pkt.id,
+                                           OT_USBDEV_SERVER_STATUS_ERROR, 0u,
+                                           NULL, 0u,
+                                           "transfer already pending");
+    }
+
+    /* @todo check for unknown flags */
+
+    trace_ot_usbdev_transfer(s->ot_id, server->recv_pkt.id, ep, "IN", flags,
+                             max_packet_size, transfer_size, "accepted");
+
+    /* Sanity check */
+    g_assert(xfer->xfer_buf == NULL);
+
+    /* record transfer */
+    xfer->id = server->recv_pkt.id;
+    xfer->xfer_len = transfer_size;
+    /* @todo do some basic checks on reasonable length? */
+    xfer->xfer_buf = g_malloc(transfer_size);
+    xfer->max_packet_size = max_packet_size;
+    xfer->recv_buf = xfer->xfer_buf;
+    xfer->recv_rem = transfer_size;
+    xfer->pending = true;
+
+    ot_usbdev_advance_transfer_in(s, ep);
+}
+
+static void ot_usbdev_server_process_transfer_out(
+    OtUsbdevState *s, uint8_t ep, uint8_t flags, uint16_t max_packet_size,
+    uint32_t transfer_size, const uint8_t *data)
+{
+    OtUsbdevServer *server = &s->usb_server;
+    OtUsbdevServerEpOutXfer *xfer = &server->ep[ep].out;
+
+    /* It is an error to send a transfer if one is pending */
+    if (xfer->pending) {
+        trace_ot_usbdev_transfer(s->ot_id, server->recv_pkt.id, ep, "OUT",
+                                 flags, max_packet_size, transfer_size,
+                                 "error (transfer already pending)");
+        ot_usbdev_server_complete_transfer(s, server->recv_pkt.id,
+                                           OT_USBDEV_SERVER_STATUS_ERROR, 0u,
+                                           NULL, 0u,
+                                           "transfer already pending");
+    }
+
+    /* @todo check for unknown flags */
+    bool zlp = (flags & OT_USBDEV_SERVER_FLAG_ZLP) != 0u;
+
+    /* @todo check max packet size is smaller than buffer size! */
+
+    trace_ot_usbdev_transfer(s->ot_id, server->recv_pkt.id, ep, "OUT", flags,
+                             max_packet_size, transfer_size, "accepted");
+
+    /* sanity check */
+    g_assert(xfer->xfer_buf == NULL);
+
+    /* record transfer */
+    xfer->id = server->recv_pkt.id;
+    /* @todo do some basic checks on reasonable length? */
+    xfer->xfer_buf = g_malloc(transfer_size);
+    memcpy(xfer->xfer_buf, data, transfer_size);
+    xfer->xfer_len = transfer_size;
+    xfer->max_packet_size = max_packet_size;
+    xfer->send_buf = xfer->xfer_buf;
+    xfer->send_rem = transfer_size;
+    /*
+     * Due to the logic in ot_usbdev_advance_transfer_out, the ZLP flag
+     * must only be set for non-zero length transfers, otherwise we will
+     * send two ZLPs.
+     */
+    xfer->send_zlp = zlp && transfer_size != 0u;
+    xfer->pending = true;
+
+    ot_usbdev_advance_transfer_out(s, ep);
+}
+
+static void ot_usbdev_server_process_transfer(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->recv_pkt.size < sizeof(OtUsbdevServerTransferPkt)) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "TRANSFER packet with unexpectedly small payload size, "
+                      "ignoring packet");
+        return;
+    }
+
+    OtUsbdevServerTransferPkt xfer;
+    memcpy(&xfer, server->recv_data, sizeof(OtUsbdevServerTransferPkt));
+
+    uint8_t epnum = xfer.endpoint & OT_USBDEV_EP_NUM_MASK;
+    bool dir_in = (xfer.endpoint & OT_USBDEV_EP_DIR_IN) == OT_USBDEV_EP_DIR_IN;
+
+    /* Ignore if device is not enabled */
+    if (resettable_is_in_reset(OBJECT(s))) {
+        trace_ot_usbdev_transfer(s->ot_id, server->recv_pkt.id, epnum,
+                                 dir_in ? "IN" : "OUT", xfer.flags,
+                                 xfer.packet_size, xfer.transfer_size,
+                                 "ignored (device is in reset)");
+        ot_usbdev_server_complete_transfer(s, server->recv_pkt.id,
+                                           OT_USBDEV_SERVER_STATUS_ERROR, 0u,
+                                           NULL, 0u, "device is in reset");
+        return;
+    }
+
+    if (epnum >= USBDEV_PARAM_N_ENDPOINTS) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "TRANSFER to non-existent endpoint, ignoring packet");
+        return;
+    }
+
+    uint32_t expected_data_len = dir_in ? 0u : xfer.transfer_size;
+    if (server->recv_pkt.size !=
+        sizeof(OtUsbdevServerTransferPkt) + expected_data_len) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id,
+            "TRANSFER packet with unexpected payload size, ignoring packet");
+        return;
+    }
+
+    if (dir_in) {
+        ot_usbdev_server_process_transfer_in(s, epnum, xfer.flags,
+                                             xfer.packet_size,
+                                             xfer.transfer_size);
+    } else {
+        const uint8_t *data =
+            server->recv_data + sizeof(OtUsbdevServerTransferPkt);
+        ot_usbdev_server_process_transfer_out(s, epnum, xfer.flags,
+                                              xfer.packet_size,
+                                              xfer.transfer_size, data);
+    }
 }
 
 static void ot_usbdev_server_process_packet(OtUsbdevState *s)
@@ -1138,8 +2272,8 @@ static void ot_usbdev_server_process_packet(OtUsbdevState *s)
     /* If HELLO hasn't been received yet, ignore everything else */
     if (server->recv_pkt.cmd != OT_USBDEV_SERVER_CMD_HELLO &&
         !server->hello_done) {
-        error_report("%s: %s server: unexpected command %u before HELLO\n",
-                     __func__, s->ot_id, server->recv_pkt.cmd);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "unexpected command before HELLO, ignoring packet");
         /* Do not process packet */
         return;
     }
@@ -1157,9 +2291,15 @@ static void ot_usbdev_server_process_packet(OtUsbdevState *s)
     case OT_USBDEV_SERVER_CMD_VBUS_OFF:
         ot_usbdev_server_process_vbus_changed(s, false);
         break;
+    case OT_USBDEV_SERVER_CMD_SETUP:
+        ot_usbdev_server_process_setup(s);
+        break;
+    case OT_USBDEV_SERVER_CMD_TRANSFER:
+        ot_usbdev_server_process_transfer(s);
+        break;
     default:
-        error_report("%s: %s server: unknown packet type %u, ignoring packet\n",
-                     __func__, s->ot_id, server->recv_pkt.cmd);
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "unknown command, ignoring packet");
         break;
     }
 
@@ -1173,6 +2313,8 @@ static void ot_usbdev_server_advance_recv_state(OtUsbdevState *s)
     if (server->recv_state == OT_USBDEV_SERVER_RECV_WAIT_HEADER) {
         /* We received a header, now receive data if necessary */
         if (server->recv_pkt.size > 0u) {
+            /* sanity check */
+            g_assert(server->recv_data == NULL);
             /* @todo have some bound on allocation size here? */
             server->recv_data = g_malloc(server->recv_pkt.size);
             server->recv_rem = server->recv_pkt.size;
@@ -1385,7 +2527,12 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
     /* @todo cancel everything here. */
 
     /* See BFM (dut_reset) */
-    memset(s->regs, 0, sizeof(s->regs));
+    memset(s->regs, 0u, sizeof(s->regs));
+
+    ot_fifo32_reset(&s->rx_fifo);
+    fifo8_reset(&s->av_setup_fifo);
+    fifo8_reset(&s->av_out_fifo);
+
     /*
      * @todo The BFM says that 'Disconnected' is held at 1 during IP
      * reset, need to investigate this detail.
@@ -1405,6 +2552,7 @@ static void ot_usbdev_reset_exit(Object *obj, ResetType type)
     }
 
     ot_usbdev_update_vbus(s);
+    ot_usbdev_update_fifos_status(s);
 }
 
 static void ot_usbdev_init(Object *obj)
@@ -1427,6 +2575,10 @@ static void ot_usbdev_init(Object *obj)
                           TYPE_OT_USBDEV ".buffer", USBDEV_BUFFER_SIZE);
     memory_region_add_subregion(&s->mmio.main, USBDEV_BUFFER_OFFSET,
                                 &s->mmio.buffer);
+
+    ot_fifo32_create(&s->rx_fifo, OT_USBDEV_RX_FIFO_DEPTH);
+    fifo8_create(&s->av_out_fifo, OT_USBDEV_AV_OUT_FIFO_DEPTH);
+    fifo8_create(&s->av_setup_fifo, OT_USBDEV_AV_SETUP_FIFO_DEPTH);
 }
 
 static void ot_usbdev_class_init(ObjectClass *klass, void *data)
