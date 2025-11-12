@@ -39,6 +39,7 @@
 #include "qemu/log.h"
 #include "chardev/char-fe.h"
 #include "hw/opentitan/ot_alert.h"
+#include "hw/opentitan/ot_common.h"
 #include "hw/opentitan/ot_fifo32.h"
 #include "hw/opentitan/ot_usbdev.h"
 #include "hw/qdev-properties-system.h"
@@ -62,6 +63,9 @@
 #define OT_USBDEV_AV_OUT_FIFO_DEPTH   8u
 #define OT_USBDEV_MAX_PACKET_SIZE     64u
 #define OT_USBDEV_BUFFER_COUNT        32u
+
+/* Time in milliseconds for a bus reset to complete. */
+#define USBDEV_BUS_RESET_TIME_MS 10
 
 /* Standard constants */
 #define OT_USBDEV_SETUP_PACKET_SIZE 8u
@@ -527,6 +531,11 @@ struct OtUsbdevState {
     CharBackend usb_chr;
     OtUsbdevServer usb_server;
 
+    /* Timer to handle bus reset. */
+    QEMUTimer bus_reset_timer;
+    /* A bus reset is in progress */
+    bool bus_reset_in_progress;
+
     char *ot_id;
     /* Link to the clkmgr. */
     DeviceState *clock_src;
@@ -630,6 +639,10 @@ static void ot_usbdev_update_status_irqs(OtUsbdevState *s)
             set_mask |= USBDEV_INTR_PKT_RECEIVED_MASK;
         }
     }
+    /*
+     * @todo The BFM says that 'Disconnected' is held at 1 during IP
+     * reset, need to investigate this detail.
+     */
     s->regs[R_USBDEV_INTR_STATE] |= set_mask;
 }
 
@@ -1031,6 +1044,22 @@ static void ot_usbdev_retire_in_packets(OtUsbdevState *s, uint8_t ep)
 }
 
 /*
+ * Callback to notify bus reset completion. The timer is started
+ * in ot_usbdev_simulate_link_reset.
+ */
+static void ot_usbdev_link_reset_complete(void *opaque)
+{
+    OtUsbdevState *s = opaque;
+    s->bus_reset_in_progress = false;
+
+    trace_ot_usbdev_link_reset(s->ot_id, true);
+
+    if (ot_usbdev_has_vbus(s) && ot_usbdev_is_enabled(s)) {
+        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE_NOSOF);
+    }
+}
+
+/*
  * Simulate a link reset.
  *
  * This function will trigger all necessary state and IRQs changes necessary to
@@ -1039,8 +1068,9 @@ static void ot_usbdev_retire_in_packets(OtUsbdevState *s, uint8_t ep)
 static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
 {
     g_assert(!resettable_is_in_reset(OBJECT(s)));
+    g_assert(!s->bus_reset_in_progress);
 
-    trace_ot_usbdev_link_reset(s->ot_id);
+    trace_ot_usbdev_link_reset(s->ot_id, false);
 
     /* We cannot simulate a reset if the device is disconnected! */
     if (ot_usbdev_get_link_state(s) == OT_USBDEV_LINK_STATE_DISCONNECTED) {
@@ -1053,6 +1083,7 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
     s->regs[R_USBCTRL] =
         FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
     s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_RESET_MASK;
+    ot_usbdev_update_irqs(s);
 
     for (unsigned ep = 0; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
         /* Cancel any pending IN packets */
@@ -1065,16 +1096,14 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
                                         "cancelled by link reset");
     }
 
-    if (ot_usbdev_has_vbus(s) && ot_usbdev_is_enabled(s)) {
-        /*
-         * @todo BFM has some extra state processing but it seems incorrect
-         * @todo If we start tracking frames, this should transition the link
-         * state to ACTIVE_NOSOF and then simulate a transition to ACTIVE on
-         * the next SOF.
-         */
-        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE);
-    }
-    ot_usbdev_update_irqs(s);
+    /*
+     * On real hardware, reset signalling typically takes several milliseconds
+     * so we kick a timer to trigger the link state change after the end of
+     * signalling.
+     */
+    s->bus_reset_in_progress = true;
+    int64_t now = qemu_clock_get_ms(OT_VIRTUAL_CLOCK);
+    timer_mod(&s->bus_reset_timer, now + USBDEV_BUS_RESET_TIME_MS);
 }
 
 /*
@@ -2337,6 +2366,14 @@ static int ot_usbdev_chr_usb_can_receive(void *opaque)
 {
     OtUsbdevState *s = opaque;
 
+    /*
+     * If bus reset signalling is in progress, delay
+     * reception until it is done.
+     */
+    if (s->bus_reset_in_progress) {
+        return 0;
+    }
+
     /* Return remaining size in the buffer. */
     return (int)s->usb_server.recv_rem;
 }
@@ -2525,7 +2562,16 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
         c->parent_phases.enter(obj, type);
     }
 
-    /* @todo cancel everything here. */
+
+    /*
+     * If there is a bus reset in progress, we cancel it.
+     * The rationale is that on a real bus, the device
+     * reset would cause the block to disable the pullup
+     * so the host would notice the disconnection and stop
+     * reset signalling.
+     */
+    timer_del(&s->bus_reset_timer);
+    s->bus_reset_in_progress = false;
 
     /* See BFM (dut_reset) */
     memset(s->regs, 0u, sizeof(s->regs));
@@ -2534,10 +2580,7 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
     fifo8_reset(&s->av_setup_fifo);
     fifo8_reset(&s->av_out_fifo);
 
-    /*
-     * @todo The BFM says that 'Disconnected' is held at 1 during IP
-     * reset, need to investigate this detail.
-     */
+    ot_usbdev_update_status_irqs(s);
     ot_usbdev_update_irqs(s);
 }
 
@@ -2580,6 +2623,9 @@ static void ot_usbdev_init(Object *obj)
     ot_fifo32_create(&s->rx_fifo, OT_USBDEV_RX_FIFO_DEPTH);
     fifo8_create(&s->av_out_fifo, OT_USBDEV_AV_OUT_FIFO_DEPTH);
     fifo8_create(&s->av_setup_fifo, OT_USBDEV_AV_SETUP_FIFO_DEPTH);
+
+    timer_init_ms(&s->bus_reset_timer, OT_VIRTUAL_CLOCK,
+                  &ot_usbdev_link_reset_complete, s);
 }
 
 static void ot_usbdev_class_init(ObjectClass *klass, void *data)
