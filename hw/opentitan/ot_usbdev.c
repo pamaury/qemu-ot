@@ -615,6 +615,8 @@ static void ot_usbdev_complete_transfer_out(OtUsbdevState *s, uint8_t epnum,
                                             OtUsbdevServerTransferStatus status,
                                             const char *msg);
 static bool ot_usbdev_is_enabled(const OtUsbdevState *s);
+static void
+ot_usbdev_cancel_all_transfers(OtUsbdevState *s, const char *reason);
 
 /*
  * Update the INTR_STATE register for status interrupts.
@@ -1003,6 +1005,8 @@ static void ot_usbdev_update_vbus(OtUsbdevState *s)
             s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_DISCONNECTED_MASK;
             s->regs[R_USBCTRL] =
                 FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
+
+            ot_usbdev_cancel_all_transfers(s, "VBUS was disconnected");
         }
     }
 
@@ -1088,13 +1092,8 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
     for (unsigned ep = 0; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
         /* Cancel any pending IN packets */
         ot_usbdev_retire_in_packets(s, ep);
-        /* Cancel all pending transfers on the server */
-        ot_usbdev_complete_transfer_in(s, ep, OT_USBDEV_SERVER_STATUS_CANCELLED,
-                                       "cancelled by link reset");
-        ot_usbdev_complete_transfer_out(s, ep,
-                                        OT_USBDEV_SERVER_STATUS_CANCELLED,
-                                        "cancelled by link reset");
     }
+    ot_usbdev_cancel_all_transfers(s, "cancelled by link reset");
 
     /*
      * On real hardware, reset signalling typically takes several milliseconds
@@ -1256,6 +1255,21 @@ void ot_usbdev_complete_transfer_out(OtUsbdevState *s, uint8_t epnum,
     /* cleanup */
     g_free(xfer->xfer_buf);
     memset(xfer, 0, sizeof(OtUsbdevServerEpOutXfer));
+}
+
+/*
+ * Cancel all pending transfers
+ */
+void ot_usbdev_cancel_all_transfers(OtUsbdevState *s, const char *reason)
+{
+    for (unsigned ep = 0; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
+        /* Cancel all pending transfers on the server */
+        ot_usbdev_complete_transfer_in(s, ep, OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                       reason);
+        ot_usbdev_complete_transfer_out(s, ep,
+                                        OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                        reason);
+    }
 }
 
 /*
@@ -2562,6 +2576,7 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
         c->parent_phases.enter(obj, type);
     }
 
+    ot_usbdev_cancel_all_transfers(s, "device going into reset");
 
     /*
      * If there is a bus reset in progress, we cancel it.
