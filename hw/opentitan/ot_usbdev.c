@@ -985,12 +985,12 @@ static void ot_usbdev_update_vbus(OtUsbdevState *s)
     /* VBUS was turned off */
     else {
         /* See BFM (bus_disconnect) */
-        g_assert(ot_usbdev_get_link_state(s) !=
-                 OT_USBDEV_LINK_STATE_DISCONNECTED);
-        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_DISCONNECTED);
-        s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_DISCONNECTED_MASK;
-        s->regs[R_USBCTRL] =
-            FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
+        if (ot_usbdev_get_link_state(s) != OT_USBDEV_LINK_STATE_DISCONNECTED) {
+            ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_DISCONNECTED);
+            s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_DISCONNECTED_MASK;
+            s->regs[R_USBCTRL] =
+                FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
+        }
     }
 
     ot_usbdev_update_irqs(s);
