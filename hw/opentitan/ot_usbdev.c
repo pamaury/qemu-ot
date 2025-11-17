@@ -2497,24 +2497,6 @@ static void ot_usbdev_chr_cmd_receive(void *opaque, const uint8_t *buf,
 /*
  * QEMU Initialization
  */
-
-static const MemoryRegionOps ot_usbdev_ops = {
-    .read = &ot_usbdev_read,
-    .write = &ot_usbdev_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .impl.min_access_size = sizeof(uint32_t),
-    .impl.max_access_size = sizeof(uint32_t),
-};
-
-static const MemoryRegionOps ot_usbdev_buffer_ops = {
-    .read = &ot_usbdev_buffer_read,
-    .write = &ot_usbdev_buffer_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    /* @todo The RTL probably supports sub-word reads, implement this */
-    .impl.min_access_size = sizeof(uint32_t),
-    .impl.max_access_size = sizeof(uint32_t),
-};
-
 static Property ot_usbdev_properties[] = {
     DEFINE_PROP_STRING("ot_id", OtUsbdevState, ot_id),
     DEFINE_PROP_STRING("clock-name", OtUsbdevState, usbclk_name),
@@ -2536,30 +2518,22 @@ static Property ot_usbdev_properties[] = {
     DEFINE_PROP_END_OF_LIST(),
 };
 
-static void ot_usbdev_realize(DeviceState *dev, Error **errp)
-{
-    OtUsbdevState *s = OT_USBDEV(dev);
-    (void)errp;
+static const MemoryRegionOps ot_usbdev_ops = {
+    .read = &ot_usbdev_read,
+    .write = &ot_usbdev_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = sizeof(uint32_t),
+    .impl.max_access_size = sizeof(uint32_t),
+};
 
-    /* @todo: clarify if we need to track events/backend changes. */
-    qemu_chr_fe_set_handlers(&s->cmd_chr, &ot_usbdev_chr_cmd_can_receive,
-                             &ot_usbdev_chr_cmd_receive, NULL, NULL, s, NULL,
-                             true);
-
-    qemu_chr_fe_set_handlers(&s->usb_chr, &ot_usbdev_chr_usb_can_receive,
-                             &ot_usbdev_chr_usb_receive,
-                             &ot_usbdev_chr_usb_event_handler, NULL, s, NULL,
-                             true);
-
-    g_assert(s->ot_id);
-    g_assert(s->usbclk_name);
-    g_assert(s->aonclk_name);
-
-    /* If not in VBUS override mode, the VBUS gate starts on by default. */
-    if (!s->vbus_override) {
-        s->vbus_gate = true;
-    }
-}
+static const MemoryRegionOps ot_usbdev_buffer_ops = {
+    .read = &ot_usbdev_buffer_read,
+    .write = &ot_usbdev_buffer_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    /* @todo The RTL probably supports sub-word reads, implement this */
+    .impl.min_access_size = sizeof(uint32_t),
+    .impl.max_access_size = sizeof(uint32_t),
+};
 
 /*
  * QEMU reset handling
@@ -2612,6 +2586,31 @@ static void ot_usbdev_reset_exit(Object *obj, ResetType type)
 
     ot_usbdev_update_vbus(s);
     ot_usbdev_update_fifos_status(s);
+}
+
+static void ot_usbdev_realize(DeviceState *dev, Error **errp)
+{
+    OtUsbdevState *s = OT_USBDEV(dev);
+    (void)errp;
+
+    /* @todo: clarify if we need to track events/backend changes. */
+    qemu_chr_fe_set_handlers(&s->cmd_chr, &ot_usbdev_chr_cmd_can_receive,
+                             &ot_usbdev_chr_cmd_receive, NULL, NULL, s, NULL,
+                             true);
+
+    qemu_chr_fe_set_handlers(&s->usb_chr, &ot_usbdev_chr_usb_can_receive,
+                             &ot_usbdev_chr_usb_receive,
+                             &ot_usbdev_chr_usb_event_handler, NULL, s, NULL,
+                             true);
+
+    g_assert(s->ot_id);
+    g_assert(s->usbclk_name);
+    g_assert(s->aonclk_name);
+
+    /* If not in VBUS override mode, the VBUS gate starts on by default. */
+    if (!s->vbus_override) {
+        s->vbus_gate = true;
+    }
 }
 
 static void ot_usbdev_init(Object *obj)
