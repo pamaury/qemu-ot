@@ -1498,9 +1498,15 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
 static void ot_usbdev_write_usbctrl(OtUsbdevState *s, uint32_t val32)
 {
     bool old_enable = ot_usbdev_is_enabled(s);
+    uint8_t old_addr = ot_usbdev_get_address(s);
 
     /* @todo Handle resume_link_active eventually, this is a W/O field */
     s->regs[R_USBCTRL] = val32 & USBDEV_USBCTRL_R_MASK;
+
+    uint8_t new_addr = ot_usbdev_get_address(s);
+    if (old_addr != new_addr) {
+        trace_ot_usbdev_address_changed(s->ot_id, new_addr);
+    }
 
     bool enable = ot_usbdev_is_enabled(s);
     if (enable == old_enable) {
