@@ -54,6 +54,8 @@
 #define USBDEV_PARAM_NUM_ALERTS  1u
 #define USBDEV_PARAM_REG_WIDTH   32u
 
+#define USBDEV_ALL_EP_MASK ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u)
+
 /*
  * The following are not parameters of the IP but hardcoded
  * constants in the RTL.
@@ -1621,7 +1623,7 @@ ot_usbdev_update_ep_enabled(OtUsbdevState *s, hwaddr reg, uint32_t val32)
 {
     /* Find which endpoints have been disabled */
     uint32_t disabled_ep = s->regs[reg] & ~val32;
-    s->regs[reg] = val32 & ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u);
+    s->regs[reg] = val32 & USBDEV_ALL_EP_MASK;
 
     bool dir_in = reg == R_EP_IN_ENABLE;
     ot_usbdev_update_ep_xfers(s, dir_in, disabled_ep);
@@ -1640,9 +1642,8 @@ static void
 ot_usbdev_update_ep_stalled(OtUsbdevState *s, hwaddr reg, uint32_t val32)
 {
     /* Find which endpoints have been stalled */
-    uint32_t stalled_ep =
-        (~s->regs[reg] & val32) & ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u);
-    s->regs[reg] = val32 & ((1u << USBDEV_PARAM_N_ENDPOINTS) - 1u);
+    uint32_t stalled_ep = (~s->regs[reg] & val32) & USBDEV_ALL_EP_MASK;
+    s->regs[reg] = val32 & USBDEV_ALL_EP_MASK;
 
     bool dir_in = reg == R_IN_STALL;
     ot_usbdev_update_ep_xfers(s, dir_in, stalled_ep);
