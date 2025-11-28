@@ -539,6 +539,14 @@ struct OtUsbdevState {
      */
     QEMUTimer bus_reset_timer;
 
+    /*
+     * This is the next endpoint that should be considered when
+     * we have pending transfers and we need to choose which
+     * one receives a packet. This is used to provide a weak
+     * form of scheduling and ensure fairness.
+     */
+    uint8_t next_ep_out_sched_xfer;
+
     char *ot_id;
     /* Link to the clkmgr. */
     DeviceState *clock_src;
@@ -1387,8 +1395,11 @@ static void ot_usbdev_advance_transfer_in(OtUsbdevState *s, uint8_t epnum)
  * If a NAK condition is detected (e.g. the host has no transfer pending,
  * or the device has not enabled reception), this
  * function will do nothing.
+ *
+ * Return true if we were able to make progress (receive a packet), false
+ * otherwise.
  */
-static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
+static bool ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
 {
     g_assert(epnum < USBDEV_PARAM_N_ENDPOINTS);
     /* See BFM (out_packet) */
@@ -1397,7 +1408,7 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
     OtUsbdevServer *server = &s->usb_server;
     OtUsbdevServerEpOutXfer *xfer = &server->ep[epnum].out;
     if (!xfer->pending) {
-        return;
+        return false;
     }
 
     /*
@@ -1407,7 +1418,7 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
     if (!ot_usbdev_is_ep_out_enabled(s, epnum)) {
         ot_usbdev_complete_transfer_out(s, epnum, OT_USBDEV_SERVER_STATUS_ERROR,
                                         "endpoint OUT not enabled");
-        return;
+        return false;
     }
 
     /* Check for STALL */
@@ -1417,7 +1428,7 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
                                         "stalled by device");
         s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_OUT_ERR_MASK;
         ot_usbdev_update_irqs(s);
-        return;
+        return false;
     }
 
     /*
@@ -1432,7 +1443,7 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
         s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_LINK_OUT_ERR_MASK;
         ot_usbdev_update_irqs(s);
         /* "NAK" packet, OUT transfer will be retried */
-        return;
+        return false;
     }
 
     /* Write data to buffer and update transfer status */
@@ -1468,7 +1479,7 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
         ot_usbdev_complete_transfer_out(s, epnum,
                                         OT_USBDEV_SERVER_STATUS_SUCCESS,
                                         "success");
-        return;
+        return true;
     }
     if (xfer->send_rem == 0 && xfer->send_zlp) {
         /*
@@ -1478,14 +1489,7 @@ static void ot_usbdev_advance_transfer_out(OtUsbdevState *s, uint8_t epnum)
         xfer->send_zlp = false;
     }
 
-    /*
-     * @todo If the transfer is not complete and RX is still active, we need to
-     * trigger one or more packet reception. However we do not want to do that
-     * in a loop here because it could lead to starvation on other endpoints.
-     * Need to have a timer to do some scheduling.
-     */
-    qemu_log_mask(LOG_UNIMP, "%s: %s: unfinished transfer on EP%u OUT\n",
-                  __func__, s->ot_id, epnum);
+    return true;
 }
 
 /*
@@ -1595,16 +1599,33 @@ static void ot_usbdev_write_configin(OtUsbdevState *s, hwaddr reg,
 static void ot_usbdev_update_ep_xfers(OtUsbdevState *s, bool dir_in,
                                       uint32_t ep_mask)
 {
+    uint8_t last_ep_out_to_progress = 0;
     /* For each disabled ep, update the transfer to trigger an error */
-    for (uint8_t ep = 0u; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
+    for (uint8_t _ep = 0u; _ep < USBDEV_PARAM_N_ENDPOINTS; _ep++) {
+        uint8_t ep = _ep;
+        /* For OUT transfers, we do some round-robin scheduling */
+        if (!dir_in) {
+            ep = (_ep + s->next_ep_out_sched_xfer) % USBDEV_PARAM_N_ENDPOINTS;
+        }
+
         if (((ep_mask >> ep) & 1u) == 0u) {
             continue;
         }
         if (dir_in) {
             ot_usbdev_advance_transfer_in(s, ep);
         } else {
-            ot_usbdev_advance_transfer_out(s, ep);
+            if (ot_usbdev_advance_transfer_out(s, ep)) {
+                last_ep_out_to_progress = ep;
+            }
         }
+    }
+    /*
+     * For OUT transfers, set the next endpoint to consider to be the one
+     * right after the last one to make progress.
+     */
+    if (!dir_in) {
+        s->next_ep_out_sched_xfer =
+            (last_ep_out_to_progress + 1u) % USBDEV_PARAM_N_ENDPOINTS;
     }
 }
 
