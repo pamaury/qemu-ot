@@ -531,10 +531,11 @@ struct OtUsbdevState {
     CharBackend usb_chr;
     OtUsbdevServer usb_server;
 
-    /* Timer to handle bus reset. */
+    /*
+     * Timer to handle bus reset. While this timer is pending,
+     * it means that a bus reset signalling is in progress.
+     */
     QEMUTimer bus_reset_timer;
-    /* A bus reset is in progress */
-    bool bus_reset_in_progress;
 
     char *ot_id;
     /* Link to the clkmgr. */
@@ -1054,7 +1055,6 @@ static void ot_usbdev_retire_in_packets(OtUsbdevState *s, uint8_t ep)
 static void ot_usbdev_link_reset_complete(void *opaque)
 {
     OtUsbdevState *s = opaque;
-    s->bus_reset_in_progress = false;
 
     trace_ot_usbdev_link_reset(s->ot_id, true);
 
@@ -1072,7 +1072,9 @@ static void ot_usbdev_link_reset_complete(void *opaque)
 static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
 {
     g_assert(!resettable_is_in_reset(OBJECT(s)));
-    g_assert(!s->bus_reset_in_progress);
+    error_report(
+        "%s: %s: Simulating a link reset while a bus reset is already pending!",
+        __func__, s->ot_id);
 
     trace_ot_usbdev_link_reset(s->ot_id, false);
 
@@ -1100,7 +1102,6 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
      * so we kick a timer to trigger the link state change after the end of
      * signalling.
      */
-    s->bus_reset_in_progress = true;
     int64_t now = qemu_clock_get_ms(OT_VIRTUAL_CLOCK);
     timer_mod(&s->bus_reset_timer, now + USBDEV_BUS_RESET_TIME_MS);
 }
@@ -2390,7 +2391,7 @@ static int ot_usbdev_chr_usb_can_receive(void *opaque)
      * If bus reset signalling is in progress, delay
      * reception until it is done.
      */
-    if (s->bus_reset_in_progress) {
+    if (timer_pending(&s->bus_reset_timer)) {
         return 0;
     }
 
@@ -2566,7 +2567,6 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
      * reset signalling.
      */
     timer_del(&s->bus_reset_timer);
-    s->bus_reset_in_progress = false;
 
     /* See BFM (dut_reset) */
     memset(s->regs, 0u, sizeof(s->regs));
