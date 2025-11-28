@@ -1626,6 +1626,11 @@ ot_usbdev_update_ep_enabled(OtUsbdevState *s, hwaddr reg, uint32_t val32)
     s->regs[reg] = val32 & USBDEV_ALL_EP_MASK;
 
     bool dir_in = reg == R_EP_IN_ENABLE;
+    /*
+     * Only update disabled endpoints: the endpoints which became enabled
+     * cannot have any pending transfers since ot_usbdev_advance_transfer_out
+     * automatically completes transfers on disabled endpoints.
+     */
     ot_usbdev_update_ep_xfers(s, dir_in, disabled_ep);
 }
 
@@ -1646,6 +1651,11 @@ ot_usbdev_update_ep_stalled(OtUsbdevState *s, hwaddr reg, uint32_t val32)
     s->regs[reg] = val32 & USBDEV_ALL_EP_MASK;
 
     bool dir_in = reg == R_IN_STALL;
+    /*
+     * Only update stalled endpoints: the endpoints which became unstalled
+     * cannot have any pending transfers since ot_usbdev_advance_transfer_out
+     * automatically completes transfers on stalled endpoints.
+     */
     ot_usbdev_update_ep_xfers(s, dir_in, stalled_ep);
 }
 
@@ -1714,7 +1724,11 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
             val32 = ot_fifo32_pop(&s->rx_fifo);
             trace_ot_usbdev_pop_rx_fifo(s->ot_id, val32);
             ot_usbdev_update_fifos_status(s);
-            /* @todo trigger out transfers potentially */
+            /* Potentially all endpoints are now able to receive some data. */
+            if (ot_fifo32_num_free(&s->rx_fifo) == 1u) {
+                ot_usbdev_update_ep_xfers(s, /* dir_in */ false,
+                                          USBDEV_ALL_EP_MASK);
+            }
         }
         break;
     case R_USBDEV_INTR_TEST:
@@ -1807,7 +1821,11 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
             fifo8_push(&s->av_out_fifo, buf_id);
             trace_ot_usbdev_push_av_out_buffer(s->ot_id, buf_id);
             ot_usbdev_update_fifos_status(s);
-            /* @todo trigger out transfers potentially */
+            /* Potentially all endpoints are now able to receive some data. */
+            if (fifo8_num_used(&s->av_out_fifo) == 1u) {
+                ot_usbdev_update_ep_xfers(s, /* dir_in */ false,
+                                          USBDEV_ALL_EP_MASK);
+            }
         }
         break;
     case R_AVSETUPBUFFER:
