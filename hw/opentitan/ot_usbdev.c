@@ -1018,6 +1018,8 @@ static void ot_usbdev_update_vbus(OtUsbdevState *s)
                 FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
 
             ot_usbdev_cancel_all_transfers(s, "VBUS was disconnected");
+            /* If there is no host then any reset signalling stops. */
+            timer_del(&s->bus_reset_timer);
         }
     }
 
@@ -1082,9 +1084,12 @@ static void ot_usbdev_link_reset_complete(void *opaque)
 static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
 {
     g_assert(!resettable_is_in_reset(OBJECT(s)));
-    error_report(
-        "%s: %s: Simulating a link reset while a bus reset is already pending!",
-        __func__, s->ot_id);
+    if (timer_pending(&s->bus_reset_timer)) {
+        error_report("%s: %s: Simulating a link reset while a bus reset is "
+                     "already pending!",
+                     __func__, s->ot_id);
+        return;
+    }
 
     trace_ot_usbdev_link_reset(s->ot_id, false);
 
