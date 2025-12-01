@@ -362,6 +362,7 @@ typedef enum {
     OT_USBDEV_SERVER_CMD_SETUP,
     OT_USBDEV_SERVER_CMD_TRANSFER,
     OT_USBDEV_SERVER_CMD_COMPLETE,
+    OT_USBDEV_SERVER_CMD_CANCEL,
 } OtUsbdevServerCmd;
 
 typedef struct {
@@ -421,6 +422,13 @@ typedef enum {
     OT_USBDEV_SERVER_STATUS_CANCELLED,
     OT_USBDEV_SERVER_STATUS_ERROR,
 } OtUsbdevServerTransferStatus;
+
+typedef struct {
+    uint32_t xfer_id;
+} OtUsbdevServerCancelPkt;
+
+static_assert(sizeof(OtUsbdevServerCancelPkt) == 4u,
+              "Cancel packet has the wrong size");
 
 #define XFER_STATUS_ENTRY(_name) \
     [OT_USBDEV_SERVER_STATUS_##_name] = stringify(_name)
@@ -1394,6 +1402,32 @@ void ot_usbdev_cancel_all_transfers(OtUsbdevState *s, const char *reason)
                                         OT_USBDEV_SERVER_STATUS_CANCELLED,
                                         reason);
     }
+}
+
+/*
+ * Cancel a specific transfer by ID.
+ * Return true if a matching transfer was found, and false otherwise.
+ */
+static bool ot_usbdev_cancel_transfer_by_id(OtUsbdevState *s, uint32_t xfer_id,
+                                            const char *reason)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    for (unsigned ep = 0; ep < USBDEV_PARAM_N_ENDPOINTS; ep++) {
+        if (server->ep[ep].in.pending && server->ep[ep].in.id == xfer_id) {
+            ot_usbdev_complete_transfer_in(s, ep,
+                                           OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                           reason);
+            return true;
+        }
+        if (server->ep[ep].out.pending && server->ep[ep].out.id == xfer_id) {
+            ot_usbdev_complete_transfer_out(s, ep,
+                                            OT_USBDEV_SERVER_STATUS_CANCELLED,
+                                            reason);
+            return true;
+        }
+    }
+    return false;
 }
 
 /*
@@ -2486,6 +2520,27 @@ static void ot_usbdev_server_process_transfer(OtUsbdevState *s)
     }
 }
 
+static void ot_usbdev_server_process_cancel(OtUsbdevState *s)
+{
+    OtUsbdevServer *server = &s->usb_server;
+
+    if (server->recv_pkt.size != sizeof(OtUsbdevServerCancelPkt)) {
+        trace_ot_usbdev_server_protocol_error(
+            s->ot_id, "CANCEL packet with unexpected payload size, "
+                      "ignoring packet");
+        return;
+    }
+
+    OtUsbdevServerCancelPkt xfer;
+    memcpy(&xfer, server->recv_data, sizeof(OtUsbdevServerCancelPkt));
+
+    bool success = ot_usbdev_cancel_transfer_by_id(s, xfer.xfer_id,
+                                                   "Cancelled by request");
+
+    trace_ot_usbdev_cancel(s->ot_id, xfer.xfer_id,
+                           success ? "success" : "no matching transfer found");
+}
+
 static void ot_usbdev_server_process_packet(OtUsbdevState *s)
 {
     OtUsbdevServer *server = &s->usb_server;
@@ -2524,6 +2579,9 @@ static void ot_usbdev_server_process_packet(OtUsbdevState *s)
         break;
     case OT_USBDEV_SERVER_CMD_TRANSFER:
         ot_usbdev_server_process_transfer(s);
+        break;
+    case OT_USBDEV_SERVER_CMD_CANCEL:
+        ot_usbdev_server_process_cancel(s);
         break;
     default:
         trace_ot_usbdev_server_protocol_error(

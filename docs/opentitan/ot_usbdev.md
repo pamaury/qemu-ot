@@ -131,6 +131,7 @@ The following commands are defined.
 | Setup       |     9     | Host to device | Send a SETUP packet | [Setup command](#setup-command) |
 | Transfer    |    10     | Host to device | Start a transfer | [Transfer command](#transfer-command) |
 | Complete    |    11     | Device to host | Complete a transfer | [Complete command](#complete-command) |
+| Cancel      |    12     | Host to device | Cancel a transfer | [Cancel command](#cancel-command) |
 
 
 
@@ -214,6 +215,15 @@ to the host.
 Sending a `Transfer` command to an endpoint while one is already in progress is an error.
 The device must immediately reply with a `Complete` event with the `Error` status.
 
+#### Cancel command
+
+See [Transfer handling](#transfer-handling) for more details.
+The payload of this command is defined as follows.
+
+| **Field** | **Offset** | **Size** | **Value** |
+| --------- | ---------- | -------- | --------- |
+| Transfer ID |   0      |     4    | ID of the transfer to cancel |
+
 #### Complete command
 
 The ID of this command must be the ID of the corresponding `Transfer` command.
@@ -268,26 +278,43 @@ If the transfer succeeds, the device must send a `Complete` event with the `Succ
 `Size` field indicating how much data was transferred successfully (and for IN transfers, the data
 must be present in the payload).
 
+Upon receiving a `Cancel` command, the device must stop the requested transfer as soon as possible
+and send a `Complete` event with the `Cancel` status. Note that due to the asynchronous nature
+of the protocol, the following sequences of events are possible:
+- the device receives a `Cancel` command for an already completed transfer: the device must ignore
+  the request,
+- the device receives a `Cancel` command for a transfer but the transfer finishes before it can
+  be cancelled: the device must send a `Complete` event, which can either be `Cancelled` or the
+  otherwise normal status of the transfer.
+
 ### Control transfers
 
 The host should first send a `Setup` command at the selected address and endpoint.
 The device does not reply to this command. Note that the USB specification specifies that sending
 a SETUP packet to an endpoint immediately cancels any transaction on this endpoint.
-The device *may* send a `Complete` events for such transfers with the `Cancelled` status.
+The device *may* send `Complete` events for such transfers with the `Cancelled` status.
 
 The rest of the sequence depends on the direction of the transfer:
 - OUT transfers: the host should send one or more `Transfer` commands to the endpoint
-  (with the OUT direction) with the control data.
+  (with the OUT direction) with the control data and the device answers with `Complete` events.
   Once all transfers are complete, the host should send a `Transfer` command to the endpoint
-  with the IN direction and `Size` set to 0.
+  with the IN direction and `Size` set to 0, to which the device answers with a `Complete` event.
 - IN transfers: the host should send one or more `Transfer` commands to the endpoint,
-  (with the IN direction) to receive the control data.
+  (with the IN direction) and the device answers with `Complete` events containing the data.
   Once all transfers are complete, the host should send a `Transfer` command to the endpoint
-  with the OUT direction and `Size` set to 0.
+  with the OUT direction and `Size` set to 0, to which the device answers with a `Complete` event.
 
 ### Bulk and interrupt transfers
 
 TODO
+
+### Cancelling transfers
+
+If the host wishes to cancel a pending transfer, it must send the `Cancel` command with the ID
+of the corresponding `Transfer` command to be cancelled. Due to the asynchronous nature of
+the protocol, it is possible that the transfer successfully completes before the device processes
+the `Cancel` request. Therefore the host *should* wait for a `Complete` event to determine the
+final outcome of the transfer.
 
 ## Note
 
