@@ -69,6 +69,9 @@
 /* Time in milliseconds for a bus reset to complete. */
 #define OT_USBDEV_BUS_RESET_TIME_MS 10u
 
+/* Time in microseconds of a frame (fixed by spec). */
+#define OT_USBDEV_FRAME_TIME_US 1000u
+
 /* Standard constants */
 #define OT_USBDEV_SETUP_PACKET_SIZE 8u
 
@@ -538,6 +541,41 @@ struct OtUsbdevState {
      * it means that a bus reset signalling is in progress.
      */
     QEMUTimer bus_reset_timer;
+
+    /*
+     * Timer to handle frame counting. While this timer is pending,
+     * it means that the frame counter must not change and that an
+     * IRQ will be triggered when the timer expires. Also see remarks
+     * on the frame counter.
+     */
+    QEMUTimer frame_timer;
+
+    /*
+     * We keep the current frame number in the following variable. There
+     * are 1000 frames per second so we really want to avoid scheduling a
+     * timer for each frame if we can avoid it. It is very unlikely that
+     * the device will want to do so anyway and it is more likely to read
+     * the frame counter in the USBSTAT register. Therefore we can avoid
+     * using a timer as long as we create a consistent picture for the
+     * device code. This mostly means:
+     * - the frame counter should increase by one every millisecond,
+     * - the frame counter must not change value between two SOF IRQs.
+     * We can keep track of the second condition by noticing that unless
+     * the device code clears the SOF interrupt, it cannot actually detect
+     * when the SOF happens and therefore this consistency check can be
+     * relaxed. However if the device code *does* clear the SOF interrupt,
+     * we need to make sure to enforce the second requirement.
+     *
+     * Therefore the logic is as follows: we record the time at which the bus
+     * reset completed (this is the beginning of "frame 0").
+     * If the frame timer is not pending, we extrapolate the frame counter
+     * value based on the time elapsed since the last bus reset. If the software
+     * clear the SOF interrupt, a frozen value is recorded based on the
+     * previous logic and a frame timer is scheduled. While the frame
+     * timer is pending, the frame counter value is frozen to this value.
+     */
+    uint32_t frozen_frame;
+    int64_t frame0_time_us;
 
     /*
      * This is the next endpoint that should be considered when
@@ -1018,7 +1056,8 @@ static void ot_usbdev_update_vbus(OtUsbdevState *s)
                 FIELD_DP32(s->regs[R_USBCTRL], USBCTRL, DEVICE_ADDRESS, 0u);
 
             ot_usbdev_cancel_all_transfers(s, "VBUS was disconnected");
-            /* If there is no host then any reset signalling stops. */
+            /* If there is no host then any SOF or reset signalling stops. */
+            timer_del(&s->frame_timer);
             timer_del(&s->bus_reset_timer);
         }
     }
@@ -1060,6 +1099,65 @@ static void ot_usbdev_retire_in_packets(OtUsbdevState *s, uint8_t ep)
     s->regs[R_CONFIGIN_0 + ep] = configin;
 }
 
+static uint32_t ot_usbdev_get_frame(OtUsbdevState *s)
+{
+    /*
+     * See logic in the documentation of the OtUsbdevState struct:
+     * - if frame timer is pending, value is frozen
+     * - otherwise, extrapolate based on time
+     */
+    if (timer_pending(&s->frame_timer)) {
+        return s->frozen_frame;
+    }
+    int64_t time_us = qemu_clock_get_us(OT_VIRTUAL_CLOCK);
+    return (uint32_t)(time_us - s->frame0_time_us) / OT_USBDEV_FRAME_TIME_US;
+}
+
+/*
+ * Callback to simulate a start of frame. The timer is only started
+ * when needed (i.e. on bus reset complete and when the device expects
+ * an interrupt).
+ */
+static void ot_usbdev_frame_timer_expired(void *opaque)
+{
+    OtUsbdevState *s = opaque;
+
+    /*
+     * If this is the first SOF after a bus reset, we need to change the link
+     * state.
+     */
+    if (ot_usbdev_get_link_state(s) == OT_USBDEV_LINK_STATE_ACTIVE_NOSOF) {
+        ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE);
+    } else if (ot_usbdev_get_link_state(s) != OT_USBDEV_LINK_STATE_ACTIVE) {
+        /*
+         * The following should not happen but if for some reason we are
+         * not in the active state, ignore.
+         */
+        error_report("%s: %s: SOF timer expired in a non-active state",
+                     __func__, s->ot_id);
+        return;
+    }
+
+    /* Set frame interrupt. */
+    s->regs[R_USBDEV_INTR_STATE] |= USBDEV_INTR_FRAME_MASK;
+    ot_usbdev_update_irqs(s);
+}
+
+/* Schedule a frame timer for the next frame. */
+static void ot_usbdev_schedule_frame_timer(OtUsbdevState *s)
+{
+    /* Do not schedule one if one is pending. */
+    if (timer_pending(&s->frame_timer)) {
+        return;
+    }
+
+    uint32_t cur_frame = ot_usbdev_get_frame(s);
+    /* Find the time at which the next frame will start. */
+    int64_t next_frame_time_us =
+        s->frame0_time_us + (cur_frame + 1u) * OT_USBDEV_FRAME_TIME_US;
+    timer_mod(&s->frame_timer, next_frame_time_us);
+}
+
 /*
  * Callback to notify bus reset completion. The timer is started
  * in ot_usbdev_simulate_link_reset.
@@ -1072,6 +1170,13 @@ static void ot_usbdev_link_reset_complete(void *opaque)
 
     if (ot_usbdev_has_vbus(s) && ot_usbdev_is_enabled(s)) {
         ot_usbdev_set_raw_link_state(s, OT_USBDEV_LINK_STATE_ACTIVE_NOSOF);
+        /*
+         * Record "frame 0 timer" and schedule a timer for frame 1.
+         * We need the timer so that it changes the link state to active.
+         */
+        s->frame0_time_us = qemu_clock_get_us(OT_VIRTUAL_CLOCK);
+        s->frozen_frame = 0u;
+        ot_usbdev_schedule_frame_timer(s);
     }
 }
 
@@ -1111,6 +1216,9 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
         ot_usbdev_retire_in_packets(s, ep);
     }
     ot_usbdev_cancel_all_transfers(s, "cancelled by link reset");
+
+    /* Stop any frame timer pending. */
+    timer_del(&s->frame_timer);
 
     /*
      * On real hardware, reset signalling typically takes several milliseconds
@@ -1699,7 +1807,6 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
     switch (reg) {
     /* Reads with no side-effects */
     case R_PHY_CONFIG:
-    case R_USBSTAT:
     case R_USBDEV_INTR_STATE:
     case R_USBDEV_INTR_ENABLE:
     case R_USBCTRL:
@@ -1739,6 +1846,17 @@ static uint64_t ot_usbdev_read(void *opaque, hwaddr addr, unsigned size)
     case R_COUNT_NODATA_IN:
     case R_COUNT_ERRORS:
         val32 = s->regs[reg];
+        break;
+    case R_USBSTAT:
+        /*
+         * We extrapolate the frame counter on each read to avoid frequent
+         * updates. Note that the field in the register can wrap around but we
+         * internally keep track of the frame counter with all bits, so the
+         * following code will truncate the value which is the correct
+         * behaviour.
+         */
+        val32 =
+            FIELD_DP32(s->regs[reg], USBSTAT, FRAME, ot_usbdev_get_frame(s));
         break;
     case R_RXFIFO:
         if (ot_fifo32_is_empty(&s->rx_fifo)) {
@@ -1794,6 +1912,20 @@ static void ot_usbdev_write(void *opaque, hwaddr addr, uint64_t val64,
     switch (reg) {
     case R_USBDEV_INTR_STATE:
         val32 &= USBDEV_INTR_RW1C_MASK;
+        /*
+         * If the frame interrupt state was previously not clear and now becomes
+         * cleared, it means that the device will now be able to observe when
+         * the next SOF arrives. Inbetween now and that time, we must ensure
+         * that the frame counter stays frozen. See explanation in OtUsbdevState
+         * struct.
+         */
+        if ((s->regs[reg] & USBDEV_INTR_FRAME_MASK) != 0u &&
+            (val32 & USBDEV_INTR_FRAME_MASK) != 0u) {
+            s->frozen_frame = ot_usbdev_get_frame(s);
+            /* Schedule a frame timer to unfreeze. This is a no-op if one is
+             * already pending. */
+            ot_usbdev_schedule_frame_timer(s);
+        }
         s->regs[reg] &= ~val32;
         ot_usbdev_update_irqs(s);
         break;
@@ -2609,8 +2741,9 @@ static void ot_usbdev_reset_enter(Object *obj, ResetType type)
      * The rationale is that on a real bus, the device
      * reset would cause the block to disable the pullup
      * so the host would notice the disconnection and stop
-     * reset signalling.
+     * reset signalling. The same applies for the frame timer.
      */
+    timer_del(&s->frame_timer);
     timer_del(&s->bus_reset_timer);
 
     /* See BFM (dut_reset) */
@@ -2691,6 +2824,8 @@ static void ot_usbdev_init(Object *obj)
 
     timer_init_ms(&s->bus_reset_timer, OT_VIRTUAL_CLOCK,
                   &ot_usbdev_link_reset_complete, s);
+    timer_init_us(&s->frame_timer, OT_VIRTUAL_CLOCK,
+                  &ot_usbdev_frame_timer_expired, s);
 }
 
 static void ot_usbdev_class_init(ObjectClass *klass, void *data)
