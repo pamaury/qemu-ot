@@ -67,7 +67,7 @@
 #define OT_USBDEV_BUFFER_COUNT        32u
 
 /* Time in milliseconds for a bus reset to complete. */
-#define USBDEV_BUS_RESET_TIME_MS 10
+#define OT_USBDEV_BUS_RESET_TIME_MS 10u
 
 /* Standard constants */
 #define OT_USBDEV_SETUP_PACKET_SIZE 8u
@@ -1113,7 +1113,7 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
      * signalling.
      */
     int64_t now = qemu_clock_get_ms(OT_VIRTUAL_CLOCK);
-    timer_mod(&s->bus_reset_timer, now + USBDEV_BUS_RESET_TIME_MS);
+    timer_mod(&s->bus_reset_timer, now + OT_USBDEV_BUS_RESET_TIME_MS);
 }
 
 /*
