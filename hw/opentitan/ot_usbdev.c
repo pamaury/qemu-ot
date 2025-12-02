@@ -66,8 +66,11 @@
 #define OT_USBDEV_MAX_PACKET_SIZE     64u
 #define OT_USBDEV_BUFFER_COUNT        32u
 
-/* Time in milliseconds for a bus reset to complete. */
-#define OT_USBDEV_BUS_RESET_TIME_MS 10u
+/*
+ * Time in microseconds for a bus reset to complete (spec requires at least
+ * 10ms).
+ */
+#define OT_USBDEV_BUS_RESET_TIME_US 10000u
 
 /* Time in microseconds of a frame (fixed by spec). */
 #define OT_USBDEV_FRAME_TIME_US 1000u
@@ -1233,8 +1236,8 @@ static void ot_usbdev_simulate_link_reset(OtUsbdevState *s)
      * so we kick a timer to trigger the link state change after the end of
      * signalling.
      */
-    int64_t now = qemu_clock_get_ms(OT_VIRTUAL_CLOCK);
-    timer_mod(&s->bus_reset_timer, now + OT_USBDEV_BUS_RESET_TIME_MS);
+    int64_t now = qemu_clock_get_us(OT_VIRTUAL_CLOCK);
+    timer_mod(&s->bus_reset_timer, now + OT_USBDEV_BUS_RESET_TIME_US);
 }
 
 /*
@@ -2880,7 +2883,7 @@ static void ot_usbdev_init(Object *obj)
     fifo8_create(&s->av_out_fifo, OT_USBDEV_AV_OUT_FIFO_DEPTH);
     fifo8_create(&s->av_setup_fifo, OT_USBDEV_AV_SETUP_FIFO_DEPTH);
 
-    timer_init_ms(&s->bus_reset_timer, OT_VIRTUAL_CLOCK,
+    timer_init_us(&s->bus_reset_timer, OT_VIRTUAL_CLOCK,
                   &ot_usbdev_link_reset_complete, s);
     timer_init_us(&s->frame_timer, OT_VIRTUAL_CLOCK,
                   &ot_usbdev_frame_timer_expired, s);
