@@ -516,13 +516,19 @@ struct OtUsbdevState {
         MemoryRegion regs;
         MemoryRegion buffer;
     } mmio;
+    char *ot_id;
+    /* Link to the clkmgr. */
+    DeviceState *clock_src;
+    /* Name of the USB clock. */
+    char *usbclk_name;
+    /* Name of the AON clock. */
+    char *aonclk_name;
+
     IbexIRQ irqs[USBDEV_INTR_NUM];
     IbexIRQ alert;
 
     /* Register content */
     uint32_t regs[REGS_COUNT];
-    /* VBUS gate: meaning depends on the vbus_override mode */
-    bool vbus_gate;
 
     /*
      * Content of the RX FIFO: each entry is encoded like the
@@ -596,15 +602,10 @@ struct OtUsbdevState {
      */
     uint8_t next_ep_out_sched_xfer;
 
-    char *ot_id;
-    /* Link to the clkmgr. */
-    DeviceState *clock_src;
-    /* Name of the USB clock. */
-    char *usbclk_name;
-    /* Name of the AON clock. */
-    char *aonclk_name;
     /* VBUS override mode. */
     bool vbus_override;
+    /* VBUS gate: meaning depends on the vbus_override mode */
+    bool vbus_gate;
 };
 
 #define REG_NAME(_reg_) \
